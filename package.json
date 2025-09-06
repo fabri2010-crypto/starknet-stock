@@ -1,12 +1,13 @@
 {
   "name": "starknet-stock",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "private": true,
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-scripts": "5.0.1",
-    "@zxing/browser": "^0.1.1"
+    "@zxing/browser": "^0.1.1",
+    "@zxing/library": "^0.20.0"
   },
   "scripts": {
     "start": "react-scripts start",

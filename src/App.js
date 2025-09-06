@@ -1,21 +1,15 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
+import { BarcodeFormat, DecodeHintType } from "@zxing/library";
 
 const STORAGE_KEY = "starknet_stock_app";
 const CAM_KEY = "starknet_stock_camId";
 
 function useLocalStorage(key, initialValue) {
   const [value, setValue] = useState(() => {
-    try {
-      const item = window.localStorage.getItem(key);
-      return item ? JSON.parse(item) : initialValue;
-    } catch {
-      return initialValue;
-    }
+    try { const item = window.localStorage.getItem(key); return item ? JSON.parse(item) : initialValue; } catch { return initialValue; }
   });
-  useEffect(() => {
-    try { window.localStorage.setItem(key, JSON.stringify(value)); } catch {}
-  }, [key, value]);
+  useEffect(() => { try { window.localStorage.setItem(key, JSON.stringify(value)); } catch {} }, [key, value]);
   return [value, setValue];
 }
 
@@ -29,10 +23,7 @@ const seed = {
   },
 };
 
-function toDateInputValue(date) {
-  const d = new Date(date); const pad = (n)=>String(n).padStart(2,"0");
-  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-}
+function toDateInputValue(date) { const d=new Date(date); const pad=n=>String(n).padStart(2,"0"); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
 
 export default function App(){
   const [data,setData] = useLocalStorage(STORAGE_KEY, seed);
@@ -46,20 +37,16 @@ export default function App(){
     if(entered === u.pin){ setCurrentUser(next); } else { alert("PIN incorrecto"); }
   };
 
-  const inventoryBySerial = useMemo(()=>{
-    const m = new Map(); data.inventory.forEach(it=>m.set(it.serial.trim(),it)); return m;
-  },[data.inventory]);
+  const inventoryBySerial = useMemo(()=>{ const m=new Map(); data.inventory.forEach(it=>m.set(it.serial.trim(),it)); return m; },[data.inventory]);
 
   const registerIngreso = ({ date, serial, product, category, qty, location, responsible, notes }) => {
     setData((d) => {
       const exists = d.inventory.find((i) => i.serial.trim() === (serial||"").trim());
       let inventory;
       if (exists) {
-        inventory = d.inventory.map((i) =>
-          i.serial.trim() === (serial||"").trim()
-            ? { ...i, product: i.product || product, category: i.category || category, location: location || i.location, stock: (Number(i.stock || 0) + Number(qty || 0)) }
-            : i
-        );
+        inventory = d.inventory.map((i) => i.serial.trim() === (serial||"").trim()
+          ? { ...i, product: i.product || product, category: i.category || category, location: location || i.location, stock: (Number(i.stock || 0) + Number(qty || 0)) }
+          : i);
       } else {
         inventory = [ ...d.inventory, { serial, product, category, stock: Number(qty || 0), location, notes: notes || "" } ];
       }
@@ -74,12 +61,8 @@ export default function App(){
     setData((d) => {
       const movements = [...d.movements, newMov];
       let inv = d.inventory;
-      if (newMov.type === "Entrega") {
-        inv = d.inventory.map((it) => it.serial === mov.serial ? { ...it, stock: Math.max(0, (+it.stock||0) - (+mov.qty||0)) } : it );
-      }
-      if (newMov.type === "Devolución") {
-        inv = d.inventory.map((it) => it.serial === mov.serial ? { ...it, stock: (+it.stock||0) + (+mov.qty||0) } : it );
-      }
+      if (newMov.type === "Entrega") { inv = d.inventory.map((it) => it.serial === mov.serial ? { ...it, stock: Math.max(0, (+it.stock||0) - (+mov.qty||0)) } : it ); }
+      if (newMov.type === "Devolución") { inv = d.inventory.map((it) => it.serial === mov.serial ? { ...it, stock: (+it.stock||0) + (+mov.qty||0) } : it ); }
       return { ...d, movements, inventory: inv };
     });
   };
@@ -90,13 +73,11 @@ export default function App(){
         <div className="header">
           <div className="brand">
             <img src="/logo-starknet.png" className="logo" alt="STARKNET"/>
-            <div>
-              <strong>STARKNET</strong><div className="badge">INTERNET EN EL AIRE</div>
-            </div>
+            <div><strong>STARKNET</strong><div className="badge">INTERNET EN EL AIRE</div></div>
           </div>
           <div style={{display:'flex',alignItems:'center',gap:8}}>
             <span style={{fontSize:13,color:'#475569'}}>Usuario</span>
-            <select className="input" value={currentUser} onChange={e=>handleUserChange(e.target.value)}>
+            <select className="input" value={currentUser} onChange={(e)=>handleUserChange(e.target.value)}>
               {data.settings.users.map(u => <option key={u.name} value={u.name}>{u.name}</option>)}
             </select>
           </div>
@@ -122,7 +103,6 @@ export default function App(){
   );
 }
 
-// -------- Ingreso con loop de BarcodeDetector + ZXing fallback ----------
 function Ingreso({ categories, registerIngreso }) {
   const videoRef = useRef(null);
   const readerRef = useRef(null);
@@ -130,14 +110,25 @@ function Ingreso({ categories, registerIngreso }) {
   const [deviceId, setDeviceId] = useState(localStorage.getItem(CAM_KEY) || "");
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
-  const [torch, setTorch] = useState(false);
   const streamRef = useRef(null);
-  const bdLoopRef = useRef(null);
+  const zxingLoopActive = useRef(false);
+  const bdTimer = useRef(null);
 
   const [form, setForm] = useState({
     date: toDateInputValue(new Date()),
     serial: "", product: "", category: categories[0] || "", qty: 1, location: "", responsible: "", notes: ""
   });
+
+  // Hints: optimiza para códigos 1D como tus etiquetas (Code128/39/ITF/EAN/UPC)
+  const makeReader = () => {
+    const hints = new Map();
+    hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+      BarcodeFormat.CODE_128, BarcodeFormat.CODE_39, BarcodeFormat.ITF,
+      BarcodeFormat.EAN_13, BarcodeFormat.EAN_8, BarcodeFormat.UPC_A
+    ]);
+    hints.set(DecodeHintType.TRY_HARDER, true);
+    return new BrowserMultiFormatReader(hints);
+  };
 
   const loadDevices = async () => {
     try {
@@ -150,28 +141,17 @@ function Ingreso({ categories, registerIngreso }) {
         const pick = (back || cams[0] || {}).deviceId || "";
         setDeviceId(pick);
       }
-    } catch(e) {
-      setScanError("Sin permiso de cámara. Activala en los permisos del navegador.");
-    }
+    } catch(e) { setScanError("Sin permiso de cámara. Activala en los permisos del navegador."); }
   };
 
   useEffect(() => { loadDevices(); return () => stopScan(); }, []);
   useEffect(() => { if (deviceId) localStorage.setItem(CAM_KEY, deviceId); }, [deviceId]);
 
   const openStream = async () => {
-    // Preferir trasera y buena resolución
     const constraints = deviceId
       ? { video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } } }
       : { video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } } };
     const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    const track = stream.getVideoTracks()[0];
-    // intentar foco continuo si existe
-    try {
-      const caps = track.getCapabilities && track.getCapabilities();
-      if (caps && caps.focusMode && caps.focusMode.length) {
-        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
-      }
-    } catch {}
     videoRef.current.srcObject = stream;
     streamRef.current = stream;
     await videoRef.current.play();
@@ -183,39 +163,39 @@ function Ingreso({ categories, registerIngreso }) {
       setScanning(true);
       await openStream();
 
-      // 1) Si existe BarcodeDetector, usamos loop sobre el video (suele ser más fiable en Android)
-      if ("BarcodeDetector" in window) {
-        const formats = ["code_128","code_39","qr_code","ean_13","ean_8","upc_a","itf"];
-        const detector = new window.BarcodeDetector({ formats });
+      // 1) Intento con BarcodeDetector si soporta 1D
+      const supported = "BarcodeDetector" in window;
+      let bdFormats = [];
+      if (supported && window.BarcodeDetector.getSupportedFormats) {
+        try { bdFormats = await window.BarcodeDetector.getSupportedFormats(); } catch {}
+      }
+      const can1D = supported && bdFormats.some(f => ["code_128","code_39","itf","ean_13","ean_8","upc_a","codabar"].includes(f));
+
+      if (supported && can1D) {
+        const detector = new window.BarcodeDetector({ formats: ["code_128","code_39","itf","ean_13","ean_8","upc_a"] });
         const loop = async () => {
-          if (!scanning || !videoRef.current) return;
+          if (!scanning) return;
           try {
             const codes = await detector.detect(videoRef.current);
             if (codes && codes[0]) {
-              const val = codes[0].rawValue;
-              setForm(f => ({ ...f, serial: val }));
+              setForm(f => ({ ...f, serial: codes[0].rawValue }));
               try { navigator.vibrate && navigator.vibrate(100); } catch {}
               stopScan();
               return;
             }
           } catch {}
-          bdLoopRef.current = setTimeout(loop, 160); // ~6 fps
+          bdTimer.current = setTimeout(loop, 120);
         };
         loop();
-        return;
-      }
 
-      // 2) Fallback ZXing en video
-      if (!readerRef.current) readerRef.current = new BrowserMultiFormatReader();
-      await readerRef.current.decodeFromVideoDevice(deviceId || undefined, videoRef.current, (result, err, controls) => {
-        if (result) {
-          const text = result.getText();
-          setForm(f => ({ ...f, serial: text }));
-          try { navigator.vibrate && navigator.vibrate(100); } catch {}
-          controls.stop();
-          stopScan();
-        }
-      });
+        // Si a los 4 segundos no detecta, pasamos a ZXing continuo
+        setTimeout(() => {
+          if (scanning) { runZXingContinuous(); }
+        }, 4000);
+      } else {
+        // 2) Directo ZXing continuo
+        runZXingContinuous();
+      }
     } catch (e) {
       setScanning(false);
       setScanError("No pude iniciar la cámara. Probá el modo Foto.");
@@ -223,23 +203,22 @@ function Ingreso({ categories, registerIngreso }) {
     }
   };
 
-  const toggleTorch = async () => {
-    try {
-      const stream = streamRef.current || videoRef.current?.srcObject;
-      if (!stream) return;
-      const track = stream.getVideoTracks()[0];
-      const caps = track.getCapabilities ? track.getCapabilities() : {};
-      if (!caps.torch) { alert("Tu cámara no expone linterna (torch)."); return; }
-      const current = track.getSettings && track.getSettings().torch;
-      await track.applyConstraints({ advanced: [{ torch: !current }] });
-      setTorch(!current);
-    } catch (e) {
-      alert("No pude activar linterna: " + (e?.message || e));
-    }
+  const runZXingContinuous = () => {
+    if (zxingLoopActive.current) return;
+    zxingLoopActive.current = true;
+    readerRef.current = makeReader();
+    readerRef.current.decodeFromVideoElementContinuously(videoRef.current, (result, err) => {
+      if (result) {
+        setForm(f => ({ ...f, serial: result.getText() }));
+        try { navigator.vibrate && navigator.vibrate(100); } catch {}
+        stopScan();
+      }
+      // err === NotFoundException mientras no encuentra; lo ignoramos
+    });
   };
 
   const stopScan = () => {
-    if (bdLoopRef.current) { clearTimeout(bdLoopRef.current); bdLoopRef.current = null; }
+    if (bdTimer.current) { clearTimeout(bdTimer.current); bdTimer.current = null; }
     try { readerRef.current?.reset(); } catch {}
     try {
       const stream = videoRef.current && videoRef.current.srcObject;
@@ -247,7 +226,7 @@ function Ingreso({ categories, registerIngreso }) {
       if (videoRef.current) videoRef.current.srcObject = null;
     } catch {}
     streamRef.current = null;
-    setTorch(false);
+    zxingLoopActive.current = false;
     setScanning(false);
   };
 
@@ -269,7 +248,7 @@ function Ingreso({ categories, registerIngreso }) {
       const img = new Image();
       img.onload = async () => {
         try {
-          const reader = new BrowserMultiFormatReader();
+          const reader = makeReader();
           const result = await reader.decodeFromImage(img);
           setForm(f => ({ ...f, serial: result.getText() }));
         } catch { setScanError("No se detectó código en la foto."); }
@@ -287,11 +266,7 @@ function Ingreso({ categories, registerIngreso }) {
   const onSubmit = (e) => {
     e.preventDefault();
     if(!form.serial) return alert("Escaneá o escribí el Nº de serie");
-    registerIngreso({
-      date: form.date, serial: form.serial.trim(), product: form.product.trim(),
-      category: form.category, qty: Number(form.qty||0),
-      location: form.location.trim(), responsible: form.responsible.trim(), notes: form.notes.trim()
-    });
+    registerIngreso({ date: form.date, serial: form.serial.trim(), product: form.product.trim(), category: form.category, qty: Number(form.qty||0), location: form.location.trim(), responsible: form.responsible.trim(), notes: form.notes.trim() });
     setForm(f=>({ ...f, serial:"", product:"", qty:1, notes:"" }));
   };
 
@@ -299,12 +274,16 @@ function Ingreso({ categories, registerIngreso }) {
     <div className="card">
       <h2 style={{marginBottom:8}}>Ingreso de material</h2>
 
-      {scanning && <video ref={videoRef} autoPlay playsInline muted style={{width:"100%",borderRadius:12,marginBottom:10,background:"#000"}} />}
+      {scanning && (
+        <div className="scan-frame">
+          <video ref={videoRef} autoPlay playsInline muted />
+          <div className="guide"></div>
+        </div>
+      )}
       {!scanning && scanError && <div className="bad" style={{marginBottom:8}}>{scanError}</div>}
 
       <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
         <button className="btn btn-primary" onClick={startScan} disabled={scanning}>Escanear (video)</button>
-        {scanning && <button className="btn btn-ghost" onClick={toggleTorch}>{torch?"Apagar linterna":"Linterna"}</button>}
         {scanning && <button className="btn btn-ghost" onClick={stopScan}>Detener</button>}
         <select className="input" value={deviceId} onChange={e=>setDeviceId(e.target.value)} style={{minWidth:220}}>
           <option value="">(Elegir cámara)</option>
@@ -330,7 +309,7 @@ function Ingreso({ categories, registerIngreso }) {
       </form>
 
       <p style={{fontSize:12,color:'#64748b',marginTop:10}}>
-        Este modo usa <b>BarcodeDetector</b> (si está disponible) sobre el video y cae a ZXing si no. Si no lee, usá la linterna, acercá el código o probá la opción por foto.
+        Optimizado para <b>Code128 / Code39 / ITF / EAN / UPC</b> (como los de tu foto). Si no detecta en video, usá la opción por foto mientras lo revisamos.
       </p>
     </div>
   );
