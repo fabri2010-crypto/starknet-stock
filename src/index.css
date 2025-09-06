@@ -22,3 +22,4 @@ h1,h2,h3{color:var(--blue);margin:0 0 .5rem}
 .grid{display:grid;gap:10px}
 @media(min-width:900px){.grid-3{grid-template-columns:repeat(3,1fr)}}
 .footer{margin-top:20px;font-size:12px;color:#64748b}
+.bad{color:#b91c1c}

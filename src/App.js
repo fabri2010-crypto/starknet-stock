@@ -121,9 +121,12 @@ export default function App(){
   );
 }
 
+// -------- Ingreso con cámara: selección + fallback ----------
 function Ingreso({ categories, registerIngreso }) {
   const videoRef = useRef(null);
   const readerRef = useRef(null);
+  const [devices, setDevices] = useState([]);
+  const [deviceId, setDeviceId] = useState("");
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
   const [form, setForm] = useState({
@@ -131,39 +134,61 @@ function Ingreso({ categories, registerIngreso }) {
     serial: "", product: "", category: categories[0] || "", qty: 1, location: "", responsible: "", notes: ""
   });
 
-  const getBackCameraId = async () => {
+  // Cargar lista de cámaras (requiere permiso previo)
+  const loadDevices = async () => {
     try {
-      const devices = await BrowserMultiFormatReader.listVideoInputDevices();
-      if (!devices || !devices.length) return undefined;
-      const back = devices.find(d => /back|rear|environment|trás|atrás/i.test(d.label || ""));
-      return (back || devices[0]).deviceId;
-    } catch {
-      return undefined;
+      await navigator.mediaDevices.getUserMedia({ video: true });
+      const list = await navigator.mediaDevices.enumerateDevices();
+      const cams = list.filter(d => d.kind === "videoinput");
+      setDevices(cams);
+      const back = cams.find(d => /back|rear|environment|trás|atrás/i.test(d.label || ""));
+      setDeviceId((back || cams[0] || {}).deviceId || "");
+    } catch(e) {
+      setScanError("Sin permiso de cámara. Activala en los permisos del navegador.");
     }
   };
+
+  useEffect(() => { loadDevices(); return () => stopScan(); }, []);
 
   const startScan = async () => {
     setScanError("");
     try {
-      // Pre-solicitar permiso
-      await navigator.mediaDevices.getUserMedia({ video: true });
-      // Elegir cámara trasera si hay
-      const deviceId = await getBackCameraId();
       if (!readerRef.current) readerRef.current = new BrowserMultiFormatReader();
       setScanning(true);
-      await readerRef.current.decodeFromVideoDevice(deviceId, videoRef.current, (result, err, controls) => {
-        if (result) {
-          const text = result.getText();
-          setForm(f => ({ ...f, serial: text }));
-          try { navigator.vibrate && navigator.vibrate(100); } catch {}
-          controls.stop();
-          stopScan();
-        }
-      });
+
+      // 1) Intento con deviceId seleccionado (si existe)
+      if (deviceId) {
+        await readerRef.current.decodeFromVideoDevice(deviceId, videoRef.current, onResult);
+        return;
+      }
+
+      // 2) Intento con facingMode environment
+      await readerRef.current.decodeFromConstraints(
+        { video: { facingMode: { ideal: "environment" } } },
+        videoRef.current,
+        onResult
+      );
     } catch (e) {
+      // 3) Último fallback: abrir stream manual para que el usuario vea el error de permisos
       setScanning(false);
-      setScanError("No pude abrir la cámara. Revisá permisos del navegador.");
-      alert("No pude abrir la cámara: " + (e && e.message ? e.message : e));
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        if (videoRef.current) videoRef.current.srcObject = stream;
+        setScanError("No pude iniciar el lector, pero la cámara está abierta. Si no ves imagen, son permisos.");
+      } catch (err) {
+        setScanError("No pude abrir la cámara. Revisá permisos/otra app usando la cámara.");
+        alert("No pude abrir la cámara: " + (err?.message || err));
+      }
+    }
+  };
+
+  const onResult = (result, err, controls) => {
+    if (result) {
+      const text = result.getText();
+      setForm(f => ({ ...f, serial: text }));
+      try { navigator.vibrate && navigator.vibrate(100); } catch {}
+      controls.stop();
+      stopScan();
     }
   };
 
@@ -176,8 +201,6 @@ function Ingreso({ categories, registerIngreso }) {
     } catch {}
     setScanning(false);
   };
-
-  useEffect(() => () => { stopScan(); }, []);
 
   const onSubmit = (e) => {
     e.preventDefault();
@@ -195,12 +218,15 @@ function Ingreso({ categories, registerIngreso }) {
       <h2 style={{marginBottom:8}}>Ingreso de material</h2>
 
       {scanning && <video ref={videoRef} autoPlay playsInline muted style={{width:"100%",borderRadius:12,marginBottom:10,background:"#000"}} />}
-      {!scanning && scanError && <div style={{color:"#b91c1c",marginBottom:8}}>{scanError}</div>}
+      {!scanning && scanError && <div className="bad" style={{marginBottom:8}}>{scanError}</div>}
 
-      <div style={{display:'flex',gap:8,marginBottom:12}}>
-        {!scanning
-          ? <button className="btn btn-primary" onClick={startScan}>Escanear código</button>
-          : <button className="btn btn-ghost" onClick={stopScan}>Detener cámara</button>}
+      <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
+        <button className="btn btn-primary" onClick={startScan} disabled={scanning}>Escanear código</button>
+        {scanning && <button className="btn btn-ghost" onClick={stopScan}>Detener cámara</button>}
+        <select className="input" value={deviceId} onChange={e=>setDeviceId(e.target.value)} style={{minWidth:200}}>
+          <option value="">(Elegir cámara)</option>
+          {devices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}
+        </select>
       </div>
 
       <form className="grid grid-3" onSubmit={onSubmit}>
@@ -217,8 +243,10 @@ function Ingreso({ categories, registerIngreso }) {
           <button className="btn btn-orange" type="submit">Guardar ingreso</button>
         </div>
       </form>
+
       <p style={{fontSize:12,color:'#64748b',marginTop:10}}>
-        Tip: si no se abre la cámara, revisá en el navegador Permisos → Cámara → Permitir para este sitio.
+        Si ves pantalla negra o este sitio no tiene permiso de cámara: Chrome → icono del candado → Permisos → Cámara: <b>Permitir</b>.
+        Si aparece “otra app está usando la cámara”, cerrá WhatsApp, Instagram o el scanner del sistema.
       </p>
     </div>
   );
