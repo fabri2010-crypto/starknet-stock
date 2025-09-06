@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { BrowserMultiFormatReader } from "@zxing/browser";
-import { BarcodeFormat, DecodeHintType } from "@zxing/library";
+import Quagga from "@ericblade/quagga2";
 
 const STORAGE_KEY = "starknet_stock_app";
 const CAM_KEY = "starknet_stock_camId";
@@ -103,203 +102,158 @@ export default function App(){
   );
 }
 
-// ---------- Ingreso (selector de cámara + live por frames) ----------
 function Ingreso({ categories, registerIngreso }) {
-  const videoRef = useRef(null);
-  const streamRef = useRef(null);
-  const captureRef = useRef(null);
-  const timerRef = useRef(null);
-
+  const containerRef = useRef(null);
+  const [running, setRunning] = useState(false);
+  const [message, setMessage] = useState("");
   const [devices, setDevices] = useState([]);
   const [deviceId, setDeviceId] = useState(localStorage.getItem(CAM_KEY) || "");
-  const [selectedLabel, setSelectedLabel] = useState("");
-
-  const [zoom, setZoom] = useState(1);
-  const [torch, setTorch] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [msg, setMsg] = useState("");
+  const [friendly, setFriendly] = useState("");
 
   const [form, setForm] = useState({
     date: toDateInputValue(new Date()),
     serial: "", product: "", category: categories[0] || "", qty: 1, location: "", responsible: "", notes: ""
   });
 
-  // ZXing afinado a 1D
-  const makeReader = () => {
-    const hints = new Map();
-    hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-      BarcodeFormat.CODE_128, BarcodeFormat.CODE_39, BarcodeFormat.ITF,
-      BarcodeFormat.EAN_13, BarcodeFormat.EAN_8, BarcodeFormat.UPC_A
-    ]);
-    hints.set(DecodeHintType.TRY_HARDER, true);
-    return new BrowserMultiFormatReader(hints);
-  };
-  const reader = useMemo(() => makeReader(), []);
-
   useEffect(() => {
-    // Pide permiso y lista cámaras
-    const bootstrap = async () => {
+    // pedir permisos y enumerar cámaras con etiquetas
+    const boot = async () => {
       try {
         const tmp = await navigator.mediaDevices.getUserMedia({ video: true });
         tmp.getTracks().forEach(t=>t.stop());
       } catch {}
-      try {
-        const list = await navigator.mediaDevices.enumerateDevices();
-        const cams = list.filter(d => d.kind === "videoinput");
-        setDevices(cams);
-
-        // Heurística: preferir back camera que NO sea ultra-wide/macro/depth
-        const back = cams.filter(d => /back|rear|environment/i.test(d.label));
-        const notWide = back.filter(d => !/wide|ultra|macro|depth/i.test(d.label));
-        const pick = (notWide[0] || back[0] || cams[0] || {}).deviceId || "";
-        const label = (notWide[0] || back[0] || cams[0] || {}).label || "";
-        setSelectedLabel(label);
-        if (!deviceId) setDeviceId(pick);
-      } catch (e) {
-        setMsg("No pude enumerar cámaras. Revisá permisos.");
-      }
+      const list = await navigator.mediaDevices.enumerateDevices();
+      const cams = list.filter(d=>d.kind==="videoinput");
+      setDevices(cams);
+      // auto-pick: back SIN ultra/macro/depth
+      const back = cams.filter(d => /back|rear|environment/i.test(d.label));
+      const notWide = back.filter(d => !/wide|ultra|macro|depth/i.test(d.label));
+      const pick = (notWide[0] || back[0] || cams[0] || {}).deviceId || "";
+      const name = (notWide[0] || back[0] || cams[0] || {}).label || "";
+      setFriendly(name);
+      if (!deviceId) setDeviceId(pick);
     };
-    bootstrap();
+    boot();
     return () => stop();
   }, []);
 
   useEffect(()=>{
-    const lab = devices.find(d=>d.deviceId===deviceId)?.label || "";
-    if (lab) setSelectedLabel(lab);
+    const name = devices.find(d=>d.deviceId===deviceId)?.label || "";
+    setFriendly(name);
     if (deviceId) localStorage.setItem(CAM_KEY, deviceId);
   }, [deviceId, devices]);
 
-  const openStream = async () => {
-    // Cerramos stream previo
+  const quaggaConfigFor = (devId) => ({
+    inputStream: {
+      type: "LiveStream",
+      target: containerRef.current,
+      constraints: {
+        deviceId: devId ? { exact: devId } : undefined,
+        facingMode: devId ? undefined : "environment",
+        width: { ideal: 1280 }, height: { ideal: 720 }, aspectRatio: { ideal: 4/3 }
+      },
+      area: { top: "35%", right: "10%", left: "10%", bottom: "35%" }
+    },
+    locator: { patchSize: "x-large", halfSample: true },
+    decoder: {
+      readers: ["code_128_reader","code_39_reader","itf_reader","ean_reader","ean_8_reader","upc_reader"],
+      multiple: false
+    },
+    locate: true,
+    frequency: 12
+  });
+
+  const startWith = async (devId) => {
+    setMessage("");
     try {
-      const s = streamRef.current;
-      if (s) s.getTracks().forEach(t=>t.stop());
-      if (videoRef.current) videoRef.current.srcObject = null;
-    } catch {}
-
-    const constraints = deviceId
-      ? { video: { deviceId: { exact: deviceId }, width: { ideal: 2560 }, height: { ideal: 1440 }, aspectRatio: { ideal: 4/3 } } }
-      : { video: { facingMode: { ideal: "environment" }, width: { ideal: 2560 }, height: { ideal: 1440 }, aspectRatio: { ideal: 4/3 } } };
-
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    const track = stream.getVideoTracks()[0];
-    streamRef.current = stream;
-    videoRef.current.srcObject = stream;
-    await videoRef.current.play();
-
-    // preparar ImageCapture (frames de alta calidad)
-    if ("ImageCapture" in window) {
-      try { captureRef.current = new ImageCapture(track); } catch { captureRef.current = null; }
-    }
-
-    // autofocus / zoom
-    try {
-      const caps = track.getCapabilities && track.getCapabilities();
-      if (caps && caps.focusMode && caps.focusMode.length) {
-        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
-      }
-      if (caps && caps.zoom) {
-        const cur = track.getSettings().zoom || caps.zoom.min || 1;
-        setZoom(cur);
-      }
-    } catch {}
-  };
-
-  const setZoomConstraint = async (value) => {
-    try {
-      const track = streamRef.current?.getVideoTracks()[0];
-      if (!track) return;
-      await track.applyConstraints({ advanced: [{ zoom: value }] });
-      setZoom(value);
-    } catch {}
-  };
-
-  const toggleTorch = async () => {
-    try {
-      const track = streamRef.current?.getVideoTracks()[0];
-      const caps = track?.getCapabilities ? track.getCapabilities() : {};
-      if (!caps.torch) { alert("Tu cámara no expone linterna (torch)."); return; }
-      const current = track.getSettings && track.getSettings().torch;
-      await track.applyConstraints({ advanced: [{ torch: !current }] });
-      setTorch(!current);
-    } catch (e) { alert("No pude activar linterna: " + (e?.message || e)); }
-  };
-
-  const offscreen = document.createElement("canvas");
-  const ctx = offscreen.getContext("2d");
-
-  const cropROI = (bmpOrVideo) => {
-    const w = bmpOrVideo.width || bmpOrVideo.videoWidth;
-    const h = bmpOrVideo.height || bmpOrVideo.videoHeight;
-    if (!w || !h) return null;
-    const rx = Math.floor(w * 0.1), rw = Math.floor(w * 0.8);
-    const ry = Math.floor(h * 0.40), rh = Math.floor(h * 0.20);
-    offscreen.width = rw; offscreen.height = rh;
-    ctx.drawImage(bmpOrVideo, rx, ry, rw, rh, 0, 0, rw, rh);
-    return offscreen;
-  };
-
-  const decodeOnce = async (canvas) => {
-    if ("BarcodeDetector" in window) {
-      try {
-        const bd = new window.BarcodeDetector({ formats: ["code_128","code_39","itf","ean_13","ean_8","upc_a"] });
-        const codes = await bd.detect(canvas);
-        if (codes && codes[0]) return codes[0].rawValue;
-      } catch {}
-    }
-    try {
-      const res = await reader.decodeFromImage(canvas);
-      if (res) return res.getText();
-    } catch {}
-    return null;
-  };
-
-  const loopCapture = async () => {
-    if (!running) return;
-    try {
-      let source = null;
-      if (captureRef.current?.grabFrame) {
-        source = await captureRef.current.grabFrame();
-      }
-      const canvas = cropROI(source || videoRef.current);
-      if (canvas) {
-        const code = await decodeOnce(canvas);
-        if (code) {
-          setForm(f => ({ ...f, serial: code }));
-          try { navigator.vibrate && navigator.vibrate(100); } catch {}
-          stop();
-          return;
-        }
-      }
-    } catch (e) {
-      // Si la cámara elegida falla (p.ej. ultra-wide bloqueada), mostramos y detenemos
-      setMsg("Falló la cámara seleccionada. Probá elegir otra en el selector.");
-      stop();
-      return;
-    }
-    timerRef.current = setTimeout(loopCapture, 180);
-  };
-
-  const start = async () => {
-    setMsg("");
-    try {
-      await openStream();
+      await Quagga.init(quaggaConfigFor(devId));
+      Quagga.start();
       setRunning(true);
-      loopCapture();
+      Quagga.onProcessed(drawOverlay);
+      Quagga.onDetected(onDetected);
     } catch (e) {
-      setMsg("No pude iniciar la cámara. Probá elegir otra en el selector.");
-      alert("DEBUG ▶ " + (e?.name || "") + ": " + (e?.message || e));
+      setMessage("Esa cámara falló. Probá otra en el selector o usá 'Probar automáticamente'.");
+    }
+  };
+
+  const drawOverlay = (result) => {
+    const ctx = Quagga.canvas.ctx.overlay;
+    const canvas = Quagga.canvas.dom.overlay;
+    if (!ctx || !canvas) return;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    if (result && result.boxes) {
+      ctx.strokeStyle = "rgba(255,255,255,0.5)";
+      result.boxes.filter(b=>b!==result.box).forEach(b => {
+        Quagga.ImageDebug.drawPath(b, { x:0,y:1 }, ctx, { color:"rgba(255,255,255,0.3)", lineWidth:2 });
+      });
+    }
+    if (result && result.box) {
+      Quagga.ImageDebug.drawPath(result.box, { x:0,y:1 }, ctx, { color:"#00ff88", lineWidth:3 });
+    }
+    if (result && result.codeResult && result.codeResult.code) {
+      ctx.font="16px monospace"; ctx.fillStyle="#00ff88";
+      ctx.fillText(result.codeResult.code, 10, 20);
+    }
+  };
+
+  const onDetected = (res) => {
+    if (res?.codeResult?.code) {
+      const code = res.codeResult.code;
+      setForm(f => ({ ...f, serial: code }));
+      try { navigator.vibrate && navigator.vibrate(100); } catch {}
+      stop();
     }
   };
 
   const stop = () => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    try {
-      const s = streamRef.current;
-      if (s) s.getTracks().forEach(t => t.stop());
-      if (videoRef.current) videoRef.current.srcObject = null;
-    } catch {}
+    try { Quagga.stop(); } catch {}
+    Quagga.offProcessed(drawOverlay);
+    Quagga.offDetected(onDetected);
     setRunning(false);
+  };
+
+  const autoTry = async () => {
+    setMessage("Probando cámaras… apuntá el código dentro del rectángulo.");
+    const order = [...devices];
+    // orden preferente: back sin ultra/macro, luego back, luego resto
+    order.sort((a,b)=>{
+      const score = d => (/back|rear|environment/i.test(d.label)?2:0) + (!/wide|ultra|macro|depth/i.test(d.label)?1:0);
+      return score(b)-score(a);
+    });
+    for (let i=0;i<order.length;i++){
+      const d = order[i];
+      setFriendly(d.label || `Cam ${i+1}`);
+      await startWith(d.deviceId);
+      // Esperar 3 segundos a ver si detecta algo
+      const ok = await new Promise(resolve=>{
+        let hit = false;
+        const h = (res)=>{ if(res?.codeResult?.code){ hit=true; resolve(true);} };
+        const t = setTimeout(()=>resolve(hit), 3000);
+        Quagga.onDetected(h);
+        setTimeout(()=>{ Quagga.offDetected(h); clearTimeout(t); }, 3000);
+      });
+      stop();
+      if (ok) { await startWith(d.deviceId); setMessage(""); return; }
+    }
+    setMessage("No pude leer en vivo. Probá con la cámara principal desde el selector, o usá 'Escanear con foto'.");
+  };
+
+  // Fallback imagen con Quagga
+  const fileRef = useRef(null);
+  const decodeImage = (file) => {
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    Quagga.decodeSingle({
+      src: url,
+      numOfWorkers: 0,
+      inputStream: { size: 1200 },
+      decoder: { readers: ["code_128_reader","code_39_reader","itf_reader","ean_reader","ean_8_reader","upc_reader"] }
+    }, function (result) {
+      if (result && result.codeResult) {
+        setForm(f => ({ ...f, serial: result.codeResult.code }));
+      } else { alert("No se detectó código en la imagen."); }
+      URL.revokeObjectURL(url);
+    });
   };
 
   const onSubmit = (e) => {
@@ -313,30 +267,26 @@ function Ingreso({ categories, registerIngreso }) {
     <div className="card">
       <h2>Ingreso de material</h2>
 
-      <div className="small" style={{marginBottom:8}}>
-        Cámara: <b>{selectedLabel || "(sin nombre)"}</b>
+      <div className="scan">
+        <div id="interactive" ref={containerRef}></div>
+        <div className="roi"></div>
       </div>
+      {message && <div className="bad" style={{marginTop:8}}>{message}</div>}
+
       <div className="controls">
+        <span className="small">Cámara: <b>{friendly || "(sin nombre)"}</b></span>
         <select className="input" value={deviceId} onChange={e=>setDeviceId(e.target.value)} style={{minWidth:260}}>
           {devices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}
         </select>
-        {!running ? <button className="btn btn-primary" onClick={start}>Escanear (video)</button>
+        {!running ? <button className="btn btn-primary" onClick={()=>startWith(deviceId)}>Escanear (video)</button>
                   : <button className="btn btn-ghost" onClick={stop}>Detener</button>}
-        {running && <>
-          <button className="btn btn-ghost" onClick={()=>setZoomConstraint(Math.max(1, zoom-0.2))}>- Zoom</button>
-          <input className="range" type="range" min="1" max="8" step="0.1" value={zoom} onChange={e=>setZoomConstraint(parseFloat(e.target.value))}/>
-          <button className="btn btn-ghost" onClick={()=>setZoomConstraint(zoom+0.2)}>+ Zoom</button>
-          <button className="btn btn-ghost" onClick={toggleTorch}>{torch?"Apagar linterna":"Linterna"}</button>
-        </>}
+        <button className="btn btn-ghost" onClick={autoTry}>Probar cámaras automáticamente</button>
+        <button className="btn btn-orange" onClick={()=>fileRef.current && fileRef.current.click()}>Escanear con foto</button>
+        <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{display:"none"}}
+               onChange={(e)=>decodeImage(e.target.files && e.target.files[0])}/>
       </div>
 
-      <div className="scan">
-        <video ref={videoRef} className="video" autoPlay playsInline muted/>
-        <div className="belt"></div>
-      </div>
-      {msg && <div className="bad" style={{marginTop:8}}>{msg}</div>}
-
-      <form className="grid" onSubmit={onSubmit} style={{marginTop:10}}>
+      <form className="grid" onSubmit={onSubmit}>
         <input className="input" placeholder="Nº de serie (escaneado)" value={form.serial} onChange={e=>setForm({...form, serial:e.target.value})}/>
         <input className="input" placeholder="Producto" value={form.product} onChange={e=>setForm({...form, product:e.target.value})}/>
         <select className="input" value={form.category} onChange={e=>setForm({...form, category:e.target.value})}>
@@ -352,7 +302,7 @@ function Ingreso({ categories, registerIngreso }) {
       </form>
 
       <p className="small" style={{marginTop:10}}>
-        Elegí la <b>cámara principal trasera</b> en el selector (evitar “ultra‑wide / macro / depth”). El lector usa frames en alta calidad + ROI horizontal para <b>Code128/39/ITF/EAN</b>.
+        Esta versión vuelve al motor <b>Quagga2</b> (como la v09), con <b>selector</b> y un botón para <b>probar cámaras automáticamente</b>. El ROI está optimizado para <b>Code128/39/ITF/EAN</b>.
       </p>
     </div>
   );
