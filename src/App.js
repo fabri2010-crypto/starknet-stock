@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
 
 const STORAGE_KEY = "starknet_stock_app";
+const CAM_KEY = "starknet_stock_camId";
 
 function useLocalStorage(key, initialValue) {
   const [value, setValue] = useState(() => {
@@ -95,7 +96,7 @@ export default function App(){
           </div>
           <div style={{display:'flex',alignItems:'center',gap:8}}>
             <span style={{fontSize:13,color:'#475569'}}>Usuario</span>
-            <select className="input" value={currentUser} onChange={(e)=>handleUserChange(e.target.value)}>
+            <select className="input" value={currentUser} onChange={e=>handleUserChange(e.target.value)}>
               {data.settings.users.map(u => <option key={u.name} value={u.name}>{u.name}</option>)}
             </select>
           </div>
@@ -121,56 +122,89 @@ export default function App(){
   );
 }
 
-// -------- Ingreso con cámara: selección + fallback + debug ----------
+// -------- Ingreso con cámara: selector + forzar trasera + torch + recordar cámara ----------
 function Ingreso({ categories, registerIngreso }) {
   const videoRef = useRef(null);
   const readerRef = useRef(null);
   const [devices, setDevices] = useState([]);
-  const [deviceId, setDeviceId] = useState("");
+  const [deviceId, setDeviceId] = useState(localStorage.getItem(CAM_KEY) || "");
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
+  const [torch, setTorch] = useState(false);
+  const streamRef = useRef(null);
+
   const [form, setForm] = useState({
     date: toDateInputValue(new Date()),
     serial: "", product: "", category: categories[0] || "", qty: 1, location: "", responsible: "", notes: ""
   });
 
-  // Cargar lista de cámaras (requiere permiso previo)
   const loadDevices = async () => {
     try {
       await navigator.mediaDevices.getUserMedia({ video: true });
       const list = await navigator.mediaDevices.enumerateDevices();
       const cams = list.filter(d => d.kind === "videoinput");
       setDevices(cams);
-      const back = cams.find(d => /back|rear|environment|trás|atrás/i.test(d.label || ""));
-      setDeviceId((back || cams[0] || {}).deviceId || "");
+      if (!deviceId) {
+        const back = cams.find(d => /back|rear|environment|trás|atrás/i.test(d.label || ""));
+        const pick = (back || cams[0] || {}).deviceId || "";
+        setDeviceId(pick);
+      }
     } catch(e) {
       setScanError("Sin permiso de cámara. Activala en los permisos del navegador.");
     }
   };
 
   useEffect(() => { loadDevices(); return () => stopScan(); }, []);
+  useEffect(() => { if (deviceId) localStorage.setItem(CAM_KEY, deviceId); }, [deviceId]);
 
   const startScan = async () => {
     setScanError("");
     try {
       if (!readerRef.current) readerRef.current = new BrowserMultiFormatReader();
       setScanning(true);
-
-      // 1) Intento con deviceId seleccionado (si existe)
       if (deviceId) {
         await readerRef.current.decodeFromVideoDevice(deviceId, videoRef.current, onResult);
-        return;
+      } else {
+        await readerRef.current.decodeFromConstraints({ video: { facingMode: { ideal: "environment" } } }, videoRef.current, onResult);
       }
+      // guardar stream para torch
+      streamRef.current = videoRef.current.srcObject;
+    } catch (e) {
+      setScanning(false);
+      setScanError("No pude iniciar la cámara. Probá el botón Forzar trasera o el modo Foto.");
+      alert("DEBUG ▶ " + (e?.name || "") + ": " + (e?.message || e));
+    }
+  };
 
-      // 2) Intento con facingMode environment
+  const forceBack = async () => {
+    setScanError("");
+    try {
+      if (!readerRef.current) readerRef.current = new BrowserMultiFormatReader();
+      setScanning(true);
       await readerRef.current.decodeFromConstraints(
-        { video: { facingMode: { ideal: "environment" } } },
+        { video: { facingMode: { exact: "environment" } } },
         videoRef.current,
         onResult
       );
+      streamRef.current = videoRef.current.srcObject;
     } catch (e) {
       setScanning(false);
-      setScanError("No pude iniciar el lector. Probá el botón 'Probar cámara (debug)'. Detalle: " + (e?.message || e));
+      setScanError("No pude forzar la trasera. Elegí otra en el selector o usá el modo Foto.");
+      alert("DEBUG ▶ " + (e?.name || "") + ": " + (e?.message || e));
+    }
+  };
+
+  const toggleTorch = async () => {
+    try {
+      const stream = streamRef.current || videoRef.current?.srcObject;
+      if (!stream) return;
+      const track = stream.getVideoTracks()[0];
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      if (!caps.torch) { alert("Tu cámara no expone linterna (torch)."); return; }
+      await track.applyConstraints({ advanced: [{ torch: !torch }] });
+      setTorch(!torch);
+    } catch (e) {
+      alert("No pude activar linterna: " + (e?.message || e));
     }
   };
 
@@ -191,20 +225,41 @@ function Ingreso({ categories, registerIngreso }) {
       if (stream) stream.getTracks().forEach(t => t.stop());
       if (videoRef.current) videoRef.current.srcObject = null;
     } catch {}
+    streamRef.current = null;
+    setTorch(false);
     setScanning(false);
   };
 
-  // --- Botón de diagnóstico: abre la cámara sin ZXing y muestra el error exacto ---
-  const debugOpen = async () => {
+  // --- Fallback: Escanear desde foto ---
+  const fileInputRef = useRef(null);
+  const triggerPhoto = () => fileInputRef.current && fileInputRef.current.click();
+  const onPhotoPicked = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
     setScanError("");
     try {
-      const constraints = deviceId ? { video: { deviceId: { exact: deviceId } } } : { video: { facingMode: "environment" } };
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      if (videoRef.current) videoRef.current.srcObject = stream;
-      setScanning(true);
+      if ("BarcodeDetector" in window) {
+        const detector = new window.BarcodeDetector();
+        const bitmap = await createImageBitmap(file);
+        const codes = await detector.detect(bitmap);
+        if (codes && codes[0]) { setForm(f => ({ ...f, serial: codes[0].rawValue })); e.target.value=""; return; }
+      }
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = async () => {
+        try {
+          const reader = new BrowserMultiFormatReader();
+          const result = await reader.decodeFromImage(img);
+          setForm(f => ({ ...f, serial: result.getText() }));
+        } catch { setScanError("No se detectó código en la foto."); }
+        URL.revokeObjectURL(url);
+        e.target.value="";
+      };
+      img.onerror = () => { setScanError("No pude leer la imagen."); URL.revokeObjectURL(url); e.target.value=""; };
+      img.src = url;
     } catch (err) {
-      setScanError(`DEBUG ▶ ${err.name}: ${err.message}`);
-      alert(`DEBUG ▶ ${err.name}: ${err.message}`);
+      setScanError("Error leyendo la foto: " + (err?.message || err));
+      e.target.value="";
     }
   };
 
@@ -227,13 +282,16 @@ function Ingreso({ categories, registerIngreso }) {
       {!scanning && scanError && <div className="bad" style={{marginBottom:8}}>{scanError}</div>}
 
       <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
-        <button className="btn btn-primary" onClick={startScan} disabled={scanning}>Escanear código</button>
-        {scanning && <button className="btn btn-ghost" onClick={stopScan}>Detener cámara</button>}
+        <button className="btn btn-primary" onClick={startScan} disabled={scanning}>Escanear (video)</button>
+        <button className="btn btn-ghost" onClick={forceBack} disabled={scanning}>Forzar trasera</button>
+        {scanning && <button className="btn btn-ghost" onClick={toggleTorch}>{torch?"Apagar linterna":"Linterna"}</button>}
+        {scanning && <button className="btn btn-ghost" onClick={stopScan}>Detener</button>}
         <select className="input" value={deviceId} onChange={e=>setDeviceId(e.target.value)} style={{minWidth:220}}>
           <option value="">(Elegir cámara)</option>
           {devices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}
         </select>
-        <button className="btn btn-ghost" onClick={debugOpen}>Probar cámara (debug)</button>
+        <button className="btn btn-orange" type="button" onClick={triggerPhoto}>Escanear con foto</button>
+        <input ref={fileInputRef} type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={onPhotoPicked}/>
       </div>
 
       <form className="grid grid-3" onSubmit={onSubmit}>
@@ -252,8 +310,7 @@ function Ingreso({ categories, registerIngreso }) {
       </form>
 
       <p style={{fontSize:12,color:'#64748b',marginTop:10}}>
-        Si ves pantalla negra o “Could not start video source”: revisá permisos del sitio y cerrá apps que usen la cámara.
-        Con el botón <b>Probar cámara (debug)</b> vas a ver el error exacto si algo bloquea el acceso.
+        Si no te ofrece “trasera” en el selector, usá <b>Forzar trasera</b>. Si aún así falla, <b>Escanear con foto</b> abre la cámara nativa y decodifica la imagen.
       </p>
     </div>
   );
