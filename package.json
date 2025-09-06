@@ -9,13 +9,13 @@
     "react": "18.2.0",
     "react-dom": "18.2.0",
     "react-scripts": "5.0.1",
-    "schema-utils": "3.1.1"              // ← la agregamos como dependencia directa
+    "schema-utils": "3.1.1"            // ← añadida como dep directa
   },
   "overrides": {
+    "schema-utils": "3.1.1",           // ← fuerza v3 en todo el árbol
+    "terser-webpack-plugin": "5.3.10",  // ← compatible con schema-utils v3
     "ajv": "6.12.6",
-    "ajv-keywords": "3.5.2",
-    "schema-utils": "3.1.1",
-    "terser-webpack-plugin": "5.3.10"     // ← asegura compatibilidad con schema-utils v3
+    "ajv-keywords": "3.5.2"
   },
   "scripts": {
     "start": "react-scripts start",
