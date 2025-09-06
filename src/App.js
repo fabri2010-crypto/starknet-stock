@@ -103,12 +103,16 @@ export default function App(){
   );
 }
 
-// ---------- Ingreso (Live capture por frames con ImageCapture) ----------
+// ---------- Ingreso (selector de cámara + live por frames) ----------
 function Ingreso({ categories, registerIngreso }) {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const captureRef = useRef(null);
   const timerRef = useRef(null);
+
+  const [devices, setDevices] = useState([]);
+  const [deviceId, setDeviceId] = useState(localStorage.getItem(CAM_KEY) || "");
+  const [selectedLabel, setSelectedLabel] = useState("");
 
   const [zoom, setZoom] = useState(1);
   const [torch, setTorch] = useState(false);
@@ -132,13 +136,51 @@ function Ingreso({ categories, registerIngreso }) {
   };
   const reader = useMemo(() => makeReader(), []);
 
-  const openStream = async () => {
-    const constraints = {
-      video: {
-        facingMode: { ideal: "environment" },
-        width: { ideal: 2560 }, height: { ideal: 1440 } // pedimos bien alta
+  useEffect(() => {
+    // Pide permiso y lista cámaras
+    const bootstrap = async () => {
+      try {
+        const tmp = await navigator.mediaDevices.getUserMedia({ video: true });
+        tmp.getTracks().forEach(t=>t.stop());
+      } catch {}
+      try {
+        const list = await navigator.mediaDevices.enumerateDevices();
+        const cams = list.filter(d => d.kind === "videoinput");
+        setDevices(cams);
+
+        // Heurística: preferir back camera que NO sea ultra-wide/macro/depth
+        const back = cams.filter(d => /back|rear|environment/i.test(d.label));
+        const notWide = back.filter(d => !/wide|ultra|macro|depth/i.test(d.label));
+        const pick = (notWide[0] || back[0] || cams[0] || {}).deviceId || "";
+        const label = (notWide[0] || back[0] || cams[0] || {}).label || "";
+        setSelectedLabel(label);
+        if (!deviceId) setDeviceId(pick);
+      } catch (e) {
+        setMsg("No pude enumerar cámaras. Revisá permisos.");
       }
     };
+    bootstrap();
+    return () => stop();
+  }, []);
+
+  useEffect(()=>{
+    const lab = devices.find(d=>d.deviceId===deviceId)?.label || "";
+    if (lab) setSelectedLabel(lab);
+    if (deviceId) localStorage.setItem(CAM_KEY, deviceId);
+  }, [deviceId, devices]);
+
+  const openStream = async () => {
+    // Cerramos stream previo
+    try {
+      const s = streamRef.current;
+      if (s) s.getTracks().forEach(t=>t.stop());
+      if (videoRef.current) videoRef.current.srcObject = null;
+    } catch {}
+
+    const constraints = deviceId
+      ? { video: { deviceId: { exact: deviceId }, width: { ideal: 2560 }, height: { ideal: 1440 }, aspectRatio: { ideal: 4/3 } } }
+      : { video: { facingMode: { ideal: "environment" }, width: { ideal: 2560 }, height: { ideal: 1440 }, aspectRatio: { ideal: 4/3 } } };
+
     const stream = await navigator.mediaDevices.getUserMedia(constraints);
     const track = stream.getVideoTracks()[0];
     streamRef.current = stream;
@@ -147,9 +189,7 @@ function Ingreso({ categories, registerIngreso }) {
 
     // preparar ImageCapture (frames de alta calidad)
     if ("ImageCapture" in window) {
-      try {
-        captureRef.current = new ImageCapture(track);
-      } catch { captureRef.current = null; }
+      try { captureRef.current = new ImageCapture(track); } catch { captureRef.current = null; }
     }
 
     // autofocus / zoom
@@ -200,7 +240,6 @@ function Ingreso({ categories, registerIngreso }) {
   };
 
   const decodeOnce = async (canvas) => {
-    // 1) BarcodeDetector si está
     if ("BarcodeDetector" in window) {
       try {
         const bd = new window.BarcodeDetector({ formats: ["code_128","code_39","itf","ean_13","ean_8","upc_a"] });
@@ -208,7 +247,6 @@ function Ingreso({ categories, registerIngreso }) {
         if (codes && codes[0]) return codes[0].rawValue;
       } catch {}
     }
-    // 2) ZXing
     try {
       const res = await reader.decodeFromImage(canvas);
       if (res) return res.getText();
@@ -221,7 +259,7 @@ function Ingreso({ categories, registerIngreso }) {
     try {
       let source = null;
       if (captureRef.current?.grabFrame) {
-        source = await captureRef.current.grabFrame(); // frame en alta
+        source = await captureRef.current.grabFrame();
       }
       const canvas = cropROI(source || videoRef.current);
       if (canvas) {
@@ -233,8 +271,13 @@ function Ingreso({ categories, registerIngreso }) {
           return;
         }
       }
-    } catch {}
-    timerRef.current = setTimeout(loopCapture, 180); // ~5-6 fps
+    } catch (e) {
+      // Si la cámara elegida falla (p.ej. ultra-wide bloqueada), mostramos y detenemos
+      setMsg("Falló la cámara seleccionada. Probá elegir otra en el selector.");
+      stop();
+      return;
+    }
+    timerRef.current = setTimeout(loopCapture, 180);
   };
 
   const start = async () => {
@@ -244,7 +287,7 @@ function Ingreso({ categories, registerIngreso }) {
       setRunning(true);
       loopCapture();
     } catch (e) {
-      setMsg("No pude iniciar la cámara. Revisá permisos.");
+      setMsg("No pude iniciar la cámara. Probá elegir otra en el selector.");
       alert("DEBUG ▶ " + (e?.name || "") + ": " + (e?.message || e));
     }
   };
@@ -270,13 +313,13 @@ function Ingreso({ categories, registerIngreso }) {
     <div className="card">
       <h2>Ingreso de material</h2>
 
-      <div className="scan">
-        <video ref={videoRef} className="video" autoPlay playsInline muted/>
-        <div className="belt"></div>
+      <div className="small" style={{marginBottom:8}}>
+        Cámara: <b>{selectedLabel || "(sin nombre)"}</b>
       </div>
-      {msg && <div style={{color:'#b91c1c', marginTop:8}}>{msg}</div>}
-
       <div className="controls">
+        <select className="input" value={deviceId} onChange={e=>setDeviceId(e.target.value)} style={{minWidth:260}}>
+          {devices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}
+        </select>
         {!running ? <button className="btn btn-primary" onClick={start}>Escanear (video)</button>
                   : <button className="btn btn-ghost" onClick={stop}>Detener</button>}
         {running && <>
@@ -287,7 +330,13 @@ function Ingreso({ categories, registerIngreso }) {
         </>}
       </div>
 
-      <form className="grid" onSubmit={onSubmit}>
+      <div className="scan">
+        <video ref={videoRef} className="video" autoPlay playsInline muted/>
+        <div className="belt"></div>
+      </div>
+      {msg && <div className="bad" style={{marginTop:8}}>{msg}</div>}
+
+      <form className="grid" onSubmit={onSubmit} style={{marginTop:10}}>
         <input className="input" placeholder="Nº de serie (escaneado)" value={form.serial} onChange={e=>setForm({...form, serial:e.target.value})}/>
         <input className="input" placeholder="Producto" value={form.product} onChange={e=>setForm({...form, product:e.target.value})}/>
         <select className="input" value={form.category} onChange={e=>setForm({...form, category:e.target.value})}>
@@ -302,8 +351,8 @@ function Ingreso({ categories, registerIngreso }) {
         </div>
       </form>
 
-      <p style={{fontSize:12,color:'#64748b',marginTop:10}}>
-        Este modo usa <b>ImageCapture.grabFrame()</b> (o el video si no está) para obtener frames de alta calidad y leer <b>Code128/39/ITF/EAN</b> como si fueran fotos, pero en bucle.
+      <p className="small" style={{marginTop:10}}>
+        Elegí la <b>cámara principal trasera</b> en el selector (evitar “ultra‑wide / macro / depth”). El lector usa frames en alta calidad + ROI horizontal para <b>Code128/39/ITF/EAN</b>.
       </p>
     </div>
   );

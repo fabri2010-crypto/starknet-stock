@@ -20,3 +20,5 @@ body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif;background:v
 .controls{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
 .range{appearance:none;width:180px;height:6px;border-radius:6px;background:#e2e8f0}
 .range::-webkit-slider-thumb{appearance:none;width:18px;height:18px;border-radius:50%;background:var(--blue)}
+.bad{color:#b91c1c}
+.small{font-size:12px;color:#475569}
