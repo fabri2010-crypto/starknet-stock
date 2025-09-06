@@ -12,6 +12,32 @@ function useLocalStorage(key, initialValue) {
   return [value, setValue];
 }
 
+// src/App.js
+import React, { useState } from "react";
+import VideoScanner from "./lib/VideoScanner";
+
+function App() {
+  const [ultimo, setUltimo] = useState("");
+
+  return (
+    <div>
+      {/* === BLOQUE TEMPORAL DE PRUEBA === */}
+      <VideoScanner onDetected={(code) => {
+        setUltimo(code);
+        // Si tenés un input para “Nº de serie (escaneado)”, lo podés setear así:
+        const serial = document.querySelector('input[name="serial"], input[placeholder*="serie"], input[id*="serie"]');
+        if (serial) serial.value = code;
+      }} />
+      <p style={{marginTop:8}}>Último código: <b>{ultimo}</b></p>
+      {/* === FIN BLOQUE TEMPORAL === */}
+
+      {/* ... aquí continúa tu app existente ... */}
+    </div>
+  );
+}
+
+export default App;
+
 const seed = {
   inventory: [],
   movements: [],
