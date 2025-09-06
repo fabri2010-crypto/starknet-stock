@@ -1,7 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import Quagga from "@ericblade/quagga2";
+import { BrowserMultiFormatReader } from "@zxing/browser";
+import { BarcodeFormat, DecodeHintType } from "@zxing/library";
 
 const STORAGE_KEY = "starknet_stock_app";
+const CAM_KEY = "starknet_stock_camId";
 
 function useLocalStorage(key, initialValue) {
   const [value, setValue] = useState(() => {
@@ -101,80 +103,159 @@ export default function App(){
   );
 }
 
+// ---------- Ingreso (Live capture por frames con ImageCapture) ----------
 function Ingreso({ categories, registerIngreso }) {
-  const containerRef = useRef(null);
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const captureRef = useRef(null);
+  const timerRef = useRef(null);
+
+  const [zoom, setZoom] = useState(1);
+  const [torch, setTorch] = useState(false);
   const [running, setRunning] = useState(false);
-  const [message, setMessage] = useState("");
+  const [msg, setMsg] = useState("");
+
   const [form, setForm] = useState({
     date: toDateInputValue(new Date()),
     serial: "", product: "", category: categories[0] || "", qty: 1, location: "", responsible: "", notes: ""
   });
 
-  const start = async () => {
-    setMessage("");
+  // ZXing afinado a 1D
+  const makeReader = () => {
+    const hints = new Map();
+    hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+      BarcodeFormat.CODE_128, BarcodeFormat.CODE_39, BarcodeFormat.ITF,
+      BarcodeFormat.EAN_13, BarcodeFormat.EAN_8, BarcodeFormat.UPC_A
+    ]);
+    hints.set(DecodeHintType.TRY_HARDER, true);
+    return new BrowserMultiFormatReader(hints);
+  };
+  const reader = useMemo(() => makeReader(), []);
+
+  const openStream = async () => {
+    const constraints = {
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 2560 }, height: { ideal: 1440 } // pedimos bien alta
+      }
+    };
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    const track = stream.getVideoTracks()[0];
+    streamRef.current = stream;
+    videoRef.current.srcObject = stream;
+    await videoRef.current.play();
+
+    // preparar ImageCapture (frames de alta calidad)
+    if ("ImageCapture" in window) {
+      try {
+        captureRef.current = new ImageCapture(track);
+      } catch { captureRef.current = null; }
+    }
+
+    // autofocus / zoom
     try {
-      await Quagga.init({
-        inputStream: {
-          type: "LiveStream",
-          target: containerRef.current,
-          constraints: {
-            facingMode: "environment",
-            width: { min: 640, ideal: 1280, max: 1920 },
-            height: { min: 480, ideal: 720, max: 1080 }
-          },
-          area: { top: "35%", right: "10%", left: "10%", bottom: "35%" } // ROI
-        },
-        locator: { patchSize: "large", halfSample: false },
-        decoder: { readers: [
-          "code_128_reader","code_39_reader","itf_reader","ean_reader","ean_8_reader","upc_reader"
-        ], multiple: false },
-        locate: true,
-        frequency: 10
-      });
-      Quagga.start();
-      setRunning(true);
+      const caps = track.getCapabilities && track.getCapabilities();
+      if (caps && caps.focusMode && caps.focusMode.length) {
+        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+      }
+      if (caps && caps.zoom) {
+        const cur = track.getSettings().zoom || caps.zoom.min || 1;
+        setZoom(cur);
+      }
+    } catch {}
+  };
 
-      Quagga.onProcessed((result) => {
-        const ctx = Quagga.canvas.ctx.overlay;
-        const canvas = Quagga.canvas.dom.overlay;
-        if (!ctx || !canvas) return;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        if (result) {
-          if (result.boxes) {
-            ctx.strokeStyle = "rgba(255,255,255,0.5)";
-            result.boxes.filter(b => b !== result.box).forEach(b => {
-              Quagga.ImageDebug.drawPath(b, { x: 0, y: 1 }, ctx, { color: "rgba(255,255,255,0.3)", lineWidth: 2 });
-            });
-          }
-          if (result.box) {
-            Quagga.ImageDebug.drawPath(result.box, { x: 0, y: 1 }, ctx, { color: "#00ff88", lineWidth: 3 });
-          }
-          if (result.codeResult && result.codeResult.code) {
-            ctx.font = "16px monospace";
-            ctx.fillStyle = "#00ff88";
-            ctx.fillText(result.codeResult.code, 10, 20);
-          }
-        }
-      });
+  const setZoomConstraint = async (value) => {
+    try {
+      const track = streamRef.current?.getVideoTracks()[0];
+      if (!track) return;
+      await track.applyConstraints({ advanced: [{ zoom: value }] });
+      setZoom(value);
+    } catch {}
+  };
 
-      Quagga.onDetected((res) => {
-        if (res?.codeResult?.code) {
-          const code = res.codeResult.code;
+  const toggleTorch = async () => {
+    try {
+      const track = streamRef.current?.getVideoTracks()[0];
+      const caps = track?.getCapabilities ? track.getCapabilities() : {};
+      if (!caps.torch) { alert("Tu cámara no expone linterna (torch)."); return; }
+      const current = track.getSettings && track.getSettings().torch;
+      await track.applyConstraints({ advanced: [{ torch: !current }] });
+      setTorch(!current);
+    } catch (e) { alert("No pude activar linterna: " + (e?.message || e)); }
+  };
+
+  const offscreen = document.createElement("canvas");
+  const ctx = offscreen.getContext("2d");
+
+  const cropROI = (bmpOrVideo) => {
+    const w = bmpOrVideo.width || bmpOrVideo.videoWidth;
+    const h = bmpOrVideo.height || bmpOrVideo.videoHeight;
+    if (!w || !h) return null;
+    const rx = Math.floor(w * 0.1), rw = Math.floor(w * 0.8);
+    const ry = Math.floor(h * 0.40), rh = Math.floor(h * 0.20);
+    offscreen.width = rw; offscreen.height = rh;
+    ctx.drawImage(bmpOrVideo, rx, ry, rw, rh, 0, 0, rw, rh);
+    return offscreen;
+  };
+
+  const decodeOnce = async (canvas) => {
+    // 1) BarcodeDetector si está
+    if ("BarcodeDetector" in window) {
+      try {
+        const bd = new window.BarcodeDetector({ formats: ["code_128","code_39","itf","ean_13","ean_8","upc_a"] });
+        const codes = await bd.detect(canvas);
+        if (codes && codes[0]) return codes[0].rawValue;
+      } catch {}
+    }
+    // 2) ZXing
+    try {
+      const res = await reader.decodeFromImage(canvas);
+      if (res) return res.getText();
+    } catch {}
+    return null;
+  };
+
+  const loopCapture = async () => {
+    if (!running) return;
+    try {
+      let source = null;
+      if (captureRef.current?.grabFrame) {
+        source = await captureRef.current.grabFrame(); // frame en alta
+      }
+      const canvas = cropROI(source || videoRef.current);
+      if (canvas) {
+        const code = await decodeOnce(canvas);
+        if (code) {
           setForm(f => ({ ...f, serial: code }));
           try { navigator.vibrate && navigator.vibrate(100); } catch {}
           stop();
+          return;
         }
-      });
+      }
+    } catch {}
+    timerRef.current = setTimeout(loopCapture, 180); // ~5-6 fps
+  };
+
+  const start = async () => {
+    setMsg("");
+    try {
+      await openStream();
+      setRunning(true);
+      loopCapture();
     } catch (e) {
-      setMessage("No pude iniciar el escaneo. Probá dar permisos o reiniciar la cámara.");
+      setMsg("No pude iniciar la cámara. Revisá permisos.");
       alert("DEBUG ▶ " + (e?.name || "") + ": " + (e?.message || e));
     }
   };
 
   const stop = () => {
-    try { Quagga.stop(); } catch {}
-    Quagga.offProcessed();
-    Quagga.offDetected();
+    if (timerRef.current) clearTimeout(timerRef.current);
+    try {
+      const s = streamRef.current;
+      if (s) s.getTracks().forEach(t => t.stop());
+      if (videoRef.current) videoRef.current.srcObject = null;
+    } catch {}
     setRunning(false);
   };
 
@@ -185,40 +266,25 @@ function Ingreso({ categories, registerIngreso }) {
     setForm(f=>({ ...f, serial:"", product:"", qty:1, notes:"" }));
   };
 
-  // Fallback imagen con Quagga
-  const fileRef = useRef(null);
-  const decodeImage = (file) => {
-    if (!file) return;
-    const url = URL.createObjectURL(file);
-    Quagga.decodeSingle({
-      src: url,
-      numOfWorkers: 0,
-      inputStream: { size: 800 },
-      decoder: { readers: ["code_128_reader","code_39_reader","itf_reader","ean_reader","ean_8_reader","upc_reader"] }
-    }, function (result) {
-      if (result && result.codeResult) {
-        setForm(f => ({ ...f, serial: result.codeResult.code }));
-      } else { alert("No se detectó código en la imagen."); }
-      URL.revokeObjectURL(url);
-    });
-  };
-
   return (
     <div className="card">
       <h2>Ingreso de material</h2>
 
       <div className="scan">
-        <div id="interactive" ref={containerRef}></div>
-        <div className="roi"></div>
+        <video ref={videoRef} className="video" autoPlay playsInline muted/>
+        <div className="belt"></div>
       </div>
-      {message && <div style={{color:'#b91c1c', marginTop:8}}>{message}</div>}
+      {msg && <div style={{color:'#b91c1c', marginTop:8}}>{msg}</div>}
 
       <div className="controls">
         {!running ? <button className="btn btn-primary" onClick={start}>Escanear (video)</button>
                   : <button className="btn btn-ghost" onClick={stop}>Detener</button>}
-        <button className="btn btn-orange" onClick={()=>fileRef.current && fileRef.current.click()}>Escanear con foto</button>
-        <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{display:"none"}}
-               onChange={(e)=>decodeImage(e.target.files && e.target.files[0])}/>
+        {running && <>
+          <button className="btn btn-ghost" onClick={()=>setZoomConstraint(Math.max(1, zoom-0.2))}>- Zoom</button>
+          <input className="range" type="range" min="1" max="8" step="0.1" value={zoom} onChange={e=>setZoomConstraint(parseFloat(e.target.value))}/>
+          <button className="btn btn-ghost" onClick={()=>setZoomConstraint(zoom+0.2)}>+ Zoom</button>
+          <button className="btn btn-ghost" onClick={toggleTorch}>{torch?"Apagar linterna":"Linterna"}</button>
+        </>}
       </div>
 
       <form className="grid" onSubmit={onSubmit}>
@@ -237,7 +303,7 @@ function Ingreso({ categories, registerIngreso }) {
       </form>
 
       <p style={{fontSize:12,color:'#64748b',marginTop:10}}>
-        Alineá el código dentro del rectángulo punteado. En esta versión usamos <b>Quagga2</b>, que suele ser más firme para <b>Code-128/39/ITF/EAN</b> en Android.
+        Este modo usa <b>ImageCapture.grabFrame()</b> (o el video si no está) para obtener frames de alta calidad y leer <b>Code128/39/ITF/EAN</b> como si fueran fotos, pero en bucle.
       </p>
     </div>
   );
