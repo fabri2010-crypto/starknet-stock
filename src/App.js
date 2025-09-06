@@ -1,9 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { BrowserMultiFormatReader } from "@zxing/browser";
-import { BarcodeFormat, DecodeHintType } from "@zxing/library";
+import Quagga from "@ericblade/quagga2";
 
 const STORAGE_KEY = "starknet_stock_app";
-const CAM_KEY = "starknet_stock_camId";
 
 function useLocalStorage(key, initialValue) {
   const [value, setValue] = useState(() => {
@@ -83,9 +81,9 @@ export default function App(){
           </div>
         </div>
 
-        <div className="tabs">
+        <div style={{display:'flex',gap:8,margin:'10px 0'}}>
           {["inventario","ingreso","movimientos","reportes","ajustes"].map(t=>(
-            <button key={t} className={`tab ${tab===t?"active":""}`} onClick={()=>setTab(t)}>
+            <button key={t} className={`btn ${tab===t?"btn-primary":"btn-ghost"}`} onClick={()=>setTab(t)}>
               {t[0].toUpperCase()+t.slice(1)}
             </button>
           ))}
@@ -104,208 +102,80 @@ export default function App(){
 }
 
 function Ingreso({ categories, registerIngreso }) {
-  const videoRef = useRef(null);
-  const readerRef = useRef(null);
-  const [devices, setDevices] = useState([]);
-  const [deviceId, setDeviceId] = useState(localStorage.getItem(CAM_KEY) || "");
-  const [scanning, setScanning] = useState(false);
-  const [scanError, setScanError] = useState("");
-  const [zoom, setZoom] = useState(1);
-  const [torch, setTorch] = useState(false);
-  const streamRef = useRef(null);
-  const bdTimer = useRef(null);
-
+  const containerRef = useRef(null);
+  const [running, setRunning] = useState(false);
+  const [message, setMessage] = useState("");
   const [form, setForm] = useState({
     date: toDateInputValue(new Date()),
     serial: "", product: "", category: categories[0] || "", qty: 1, location: "", responsible: "", notes: ""
   });
 
-  const makeReader = () => {
-    const hints = new Map();
-    hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-      BarcodeFormat.CODE_128, BarcodeFormat.CODE_39, BarcodeFormat.ITF,
-      BarcodeFormat.EAN_13, BarcodeFormat.EAN_8, BarcodeFormat.UPC_A
-    ]);
-    hints.set(DecodeHintType.TRY_HARDER, true);
-    return new BrowserMultiFormatReader(hints);
-  };
-
-  const loadDevices = async () => {
+  const start = async () => {
+    setMessage("");
     try {
-      await navigator.mediaDevices.getUserMedia({ video: true });
-      const list = await navigator.mediaDevices.enumerateDevices();
-      const cams = list.filter(d => d.kind === "videoinput");
-      setDevices(cams);
-      if (!deviceId) {
-        const back = cams.find(d => /back|rear|environment|trás|atrás/i.test(d.label || ""));
-        const pick = (back || cams[0] || {}).deviceId || "";
-        setDeviceId(pick);
-      }
-    } catch(e) { setScanError("Sin permiso de cámara. Activala en los permisos del navegador."); }
-  };
-  useEffect(() => { loadDevices(); return () => stopScan(); }, []);
-  useEffect(() => { if (deviceId) localStorage.setItem(CAM_KEY, deviceId); }, [deviceId]);
+      await Quagga.init({
+        inputStream: {
+          type: "LiveStream",
+          target: containerRef.current,
+          constraints: {
+            facingMode: "environment",
+            width: { min: 640, ideal: 1280, max: 1920 },
+            height: { min: 480, ideal: 720, max: 1080 }
+          },
+          area: { top: "35%", right: "10%", left: "10%", bottom: "35%" } // ROI
+        },
+        locator: { patchSize: "large", halfSample: false },
+        decoder: { readers: [
+          "code_128_reader","code_39_reader","itf_reader","ean_reader","ean_8_reader","upc_reader"
+        ], multiple: false },
+        locate: true,
+        frequency: 10
+      });
+      Quagga.start();
+      setRunning(true);
 
-  const openStream = async () => {
-    const constraints = deviceId
-      ? { video: { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } } }
-      : { video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } } };
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    const track = stream.getVideoTracks()[0];
-    try {
-      const caps = track.getCapabilities && track.getCapabilities();
-      if (caps && caps.focusMode && caps.focusMode.length) {
-        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
-      }
-      if (caps && caps.zoom) {
-        setZoom(track.getSettings().zoom || caps.zoom.min || 1);
-      }
-    } catch {}
-    videoRef.current.srcObject = stream;
-    streamRef.current = stream;
-    await videoRef.current.play();
-  };
-
-  const setZoomConstraint = async (value) => {
-    try {
-      const track = streamRef.current && streamRef.current.getVideoTracks()[0];
-      if (!track) return;
-      await track.applyConstraints({ advanced: [{ zoom: value }] });
-      setZoom(value);
-    } catch {}
-  };
-
-  const toggleTorch = async () => {
-    try {
-      const track = streamRef.current && streamRef.current.getVideoTracks()[0];
-      const caps = track && track.getCapabilities ? track.getCapabilities() : {};
-      if (!caps.torch) { alert("Tu cámara no expone linterna (torch)."); return; }
-      const current = track.getSettings && track.getSettings().torch;
-      await track.applyConstraints({ advanced: [{ torch: !current }] });
-      setTorch(!current);
-    } catch (e) { alert("No pude activar linterna: " + (e?.message || e)); }
-  };
-
-  // Offscreen canvas para ROI horizontal
-  const roiCanvas = document.createElement("canvas");
-  const ctx = roiCanvas.getContext("2d");
-
-  const captureROI = () => {
-    const video = videoRef.current;
-    if (!video || video.readyState < 2) return null;
-    const vw = video.videoWidth, vh = video.videoHeight;
-    if (!vw || !vh) return null;
-    const rx = Math.floor(vw * 0.1), rw = Math.floor(vw * 0.8);
-    const ry = Math.floor(vh * 0.4), rh = Math.floor(vh * 0.2);
-    roiCanvas.width = rw; roiCanvas.height = rh;
-    ctx.drawImage(video, rx, ry, rw, rh, 0, 0, rw, rh);
-    return roiCanvas;
-  };
-
-  const startScan = async () => {
-    setScanError("");
-    try {
-      setScanning(true);
-      await openStream();
-
-      if ("BarcodeDetector" in window) {
-        const supported = window.BarcodeDetector.getSupportedFormats ? await window.BarcodeDetector.getSupportedFormats() : [];
-        const can1D = supported.length ? supported.some(f => ["code_128","code_39","itf","ean_13","ean_8","upc_a"].includes(f)) : true;
-        const detector = new window.BarcodeDetector({ formats: ["code_128","code_39","itf","ean_13","ean_8","upc_a"] });
-        let tries = 0;
-        const loop = async () => {
-          if (!scanning) return;
-          try {
-            const canvas = captureROI();
-            if (canvas) {
-              const codes = await detector.detect(canvas);
-              if (codes && codes[0]) {
-                setForm(f => ({ ...f, serial: codes[0].rawValue }));
-                try { navigator.vibrate && navigator.vibrate(100); } catch {}
-                stopScan(); return;
-              }
-            }
-          } catch {}
-          tries++;
-          bdTimer.current = setTimeout(loop, 120);
-          if (tries === 30) { // ~3.5 s
-            runZXingCanvasLoop(); // cambio a ZXing si no hay lectura
+      Quagga.onProcessed((result) => {
+        const ctx = Quagga.canvas.ctx.overlay;
+        const canvas = Quagga.canvas.dom.overlay;
+        if (!ctx || !canvas) return;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (result) {
+          if (result.boxes) {
+            ctx.strokeStyle = "rgba(255,255,255,0.5)";
+            result.boxes.filter(b => b !== result.box).forEach(b => {
+              Quagga.ImageDebug.drawPath(b, { x: 0, y: 1 }, ctx, { color: "rgba(255,255,255,0.3)", lineWidth: 2 });
+            });
           }
-        };
-        if (can1D) { loop(); return; }
-      }
+          if (result.box) {
+            Quagga.ImageDebug.drawPath(result.box, { x: 0, y: 1 }, ctx, { color: "#00ff88", lineWidth: 3 });
+          }
+          if (result.codeResult && result.codeResult.code) {
+            ctx.font = "16px monospace";
+            ctx.fillStyle = "#00ff88";
+            ctx.fillText(result.codeResult.code, 10, 20);
+          }
+        }
+      });
 
-      runZXingCanvasLoop();
+      Quagga.onDetected((res) => {
+        if (res?.codeResult?.code) {
+          const code = res.codeResult.code;
+          setForm(f => ({ ...f, serial: code }));
+          try { navigator.vibrate && navigator.vibrate(100); } catch {}
+          stop();
+        }
+      });
     } catch (e) {
-      setScanning(false);
-      setScanError("No pude iniciar la cámara. Probá el modo Foto.");
+      setMessage("No pude iniciar el escaneo. Probá dar permisos o reiniciar la cámara.");
       alert("DEBUG ▶ " + (e?.name || "") + ": " + (e?.message || e));
     }
   };
 
-  const runZXingCanvasLoop = () => {
-    const reader = makeReader();
-    const tick = async () => {
-      if (!scanning) return;
-      try {
-        const canvas = captureROI();
-        if (canvas) {
-          const result = await reader.decodeFromImage(canvas);
-          if (result) {
-            setForm(f => ({ ...f, serial: result.getText() }));
-            try { navigator.vibrate && navigator.vibrate(100); } catch {}
-            stopScan(); return;
-          }
-        }
-      } catch {}
-      setTimeout(tick, 120);
-    };
-    tick();
-  };
-
-  const stopScan = () => {
-    if (bdTimer.current) { clearTimeout(bdTimer.current); bdTimer.current = null; }
-    try { readerRef.current?.reset?.(); } catch {}
-    try {
-      const stream = videoRef.current && videoRef.current.srcObject;
-      if (stream) stream.getTracks().forEach(t => t.stop());
-      if (videoRef.current) videoRef.current.srcObject = null;
-    } catch {}
-    streamRef.current = null;
-    setScanning(false);
-  };
-
-  // --- Fallback: Escanear desde foto ---
-  const fileInputRef = useRef(null);
-  const triggerPhoto = () => fileInputRef.current && fileInputRef.current.click();
-  const onPhotoPicked = async (e) => {
-    const file = e.target.files && e.target.files[0];
-    if (!file) return;
-    setScanError("");
-    try {
-      if ("BarcodeDetector" in window) {
-        const detector = new window.BarcodeDetector();
-        const bitmap = await createImageBitmap(file);
-        const codes = await detector.detect(bitmap);
-        if (codes && codes[0]) { setForm(f => ({ ...f, serial: codes[0].rawValue })); e.target.value=""; return; }
-      }
-      const url = URL.createObjectURL(file);
-      const img = new Image();
-      img.onload = async () => {
-        try {
-          const reader = makeReader();
-          const result = await reader.decodeFromImage(img);
-          setForm(f => ({ ...f, serial: result.getText() }));
-        } catch { setScanError("No se detectó código en la foto."); }
-        URL.revokeObjectURL(url);
-        e.target.value="";
-      };
-      img.onerror = () => { setScanError("No pude leer la imagen."); URL.revokeObjectURL(url); e.target.value=""; };
-      img.src = url;
-    } catch (err) {
-      setScanError("Error leyendo la foto: " + (err?.message || err));
-      e.target.value="";
-    }
+  const stop = () => {
+    try { Quagga.stop(); } catch {}
+    Quagga.offProcessed();
+    Quagga.offDetected();
+    setRunning(false);
   };
 
   const onSubmit = (e) => {
@@ -315,34 +185,43 @@ function Ingreso({ categories, registerIngreso }) {
     setForm(f=>({ ...f, serial:"", product:"", qty:1, notes:"" }));
   };
 
+  // Fallback imagen con Quagga
+  const fileRef = useRef(null);
+  const decodeImage = (file) => {
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    Quagga.decodeSingle({
+      src: url,
+      numOfWorkers: 0,
+      inputStream: { size: 800 },
+      decoder: { readers: ["code_128_reader","code_39_reader","itf_reader","ean_reader","ean_8_reader","upc_reader"] }
+    }, function (result) {
+      if (result && result.codeResult) {
+        setForm(f => ({ ...f, serial: result.codeResult.code }));
+      } else { alert("No se detectó código en la imagen."); }
+      URL.revokeObjectURL(url);
+    });
+  };
+
   return (
     <div className="card">
-      <h2 style={{marginBottom:8}}>Ingreso de material</h2>
+      <h2>Ingreso de material</h2>
 
-      {scanning && (
-        <div className="scan-frame">
-          <video ref={videoRef} autoPlay playsInline muted />
-          <div className="belt"></div>
-        </div>
-      )}
-      {!scanning && scanError && <div className="bad" style={{marginBottom:8}}>{scanError}</div>}
+      <div className="scan">
+        <div id="interactive" ref={containerRef}></div>
+        <div className="roi"></div>
+      </div>
+      {message && <div style={{color:'#b91c1c', marginTop:8}}>{message}</div>}
 
       <div className="controls">
-        <button className="btn btn-primary" onClick={startScan} disabled={scanning}>Escanear (video)</button>
-        {scanning && <button className="btn btn-ghost" onClick={()=>setZoomConstraint(Math.max(1, zoom-0.2))}>- Zoom</button>}
-        {scanning && <input className="range" type="range" min="1" max="8" step="0.1" value={zoom} onChange={e=>setZoomConstraint(parseFloat(e.target.value))}/>}
-        {scanning && <button className="btn btn-ghost" onClick={()=>setZoomConstraint(zoom+0.2)}>+ Zoom</button>}
-        {scanning && <button className="btn btn-ghost" onClick={toggleTorch}>{torch?"Apagar linterna":"Linterna"}</button>}
-        {scanning && <button className="btn btn-ghost" onClick={stopScan}>Detener</button>}
-        <select className="input" value={deviceId} onChange={e=>setDeviceId(e.target.value)} style={{minWidth:220}}>
-          <option value="">(Elegir cámara)</option>
-          {devices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}
-        </select>
-        <button className="btn btn-orange" type="button" onClick={triggerPhoto}>Escanear con foto</button>
-        <input ref={fileInputRef} type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={onPhotoPicked}/>
+        {!running ? <button className="btn btn-primary" onClick={start}>Escanear (video)</button>
+                  : <button className="btn btn-ghost" onClick={stop}>Detener</button>}
+        <button className="btn btn-orange" onClick={()=>fileRef.current && fileRef.current.click()}>Escanear con foto</button>
+        <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{display:"none"}}
+               onChange={(e)=>decodeImage(e.target.files && e.target.files[0])}/>
       </div>
 
-      <form className="grid grid-3" onSubmit={onSubmit}>
+      <form className="grid" onSubmit={onSubmit}>
         <input className="input" placeholder="Nº de serie (escaneado)" value={form.serial} onChange={e=>setForm({...form, serial:e.target.value})}/>
         <input className="input" placeholder="Producto" value={form.product} onChange={e=>setForm({...form, product:e.target.value})}/>
         <select className="input" value={form.category} onChange={e=>setForm({...form, category:e.target.value})}>
@@ -358,7 +237,7 @@ function Ingreso({ categories, registerIngreso }) {
       </form>
 
       <p style={{fontSize:12,color:'#64748b',marginTop:10}}>
-        Alineá el código dentro de la <b>banda punteada</b> (horizontal). Ajustá <b>Zoom</b> y usá <b>Linterna</b> si hace falta.
+        Alineá el código dentro del rectángulo punteado. En esta versión usamos <b>Quagga2</b>, que suele ser más firme para <b>Code-128/39/ITF/EAN</b> en Android.
       </p>
     </div>
   );
@@ -375,7 +254,7 @@ function Movements({ movements, addMovement }){
   return (
     <div className="card">
       <h2 style={{marginBottom:8}}>Registrar movimiento</h2>
-      <form className="grid grid-3" onSubmit={(e)=>onSubmit(e, "Entrega")}>
+      <form className="grid" onSubmit={(e)=>onSubmit(e, "Entrega")}>
         <input className="input" placeholder="Nº Serie" value={form.serial} onChange={e=>setForm({...form, serial:e.target.value})}/>
         <input className="input" placeholder="Producto" value={form.product} onChange={e=>setForm({...form, product:e.target.value})}/>
         <input className="input" placeholder="Entregado a" value={form.person} onChange={e=>setForm({...form, person:e.target.value})}/>
@@ -388,7 +267,7 @@ function Movements({ movements, addMovement }){
         </div>
       </form>
       <h3 style={{marginTop:16, marginBottom:8}}>Historial</h3>
-      <table className="table">
+      <table style={{width:'100%'}}>
         <thead><tr><th>Fecha</th><th>Nº Serie</th><th>Producto</th><th>Tipo</th><th>Entregado a</th><th>Cant.</th><th>Usuario</th></tr></thead>
         <tbody>
           {movements.map((m,i)=>(
