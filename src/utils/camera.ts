@@ -1,96 +1,141 @@
-// src/utils/camera.ts
-export type CameraPick = {
-  deviceId?: string;
-  label?: string;
+/**
+ * camera.ts
+ * Utilidades para gestionar cámaras en móviles evitando la gran angular/macro
+ * y aplicando un tuning seguro (zoom 1× + focus continuo) cuando es posible.
+ */
+
+export type VideoPick = { deviceId?: string; label?: string };
+
+export type CameraChoice = {
+  deviceId: string;
+  label: string;
 };
 
-export async function ensureLabels(): Promise<void> {
-  // Algunas veces los labels vienen vacíos hasta que hay un getUserMedia inicial
-  await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
-    .then(stream => stream.getTracks().forEach(t => t.stop()))
-    .catch(() => {});
-}
+const BAD_KEYWORDS = [
+  "ultra",
+  "wide",
+  "ultrawide",
+  "0.5",
+  "macro",
+  "depth",
+  "tof",
+  "fisheye",
+];
 
-export async function listVideoInputs(): Promise<MediaDeviceInfo[]> {
-  await ensureLabels();
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  return devices.filter(d => d.kind === 'videoinput');
-}
-
-/**
- * Intenta elegir la cámara trasera "normal" evitando ultra-wide/macro.
- * Si no puede, devuelve la primera que parezca trasera.
- */
-export async function pickBackCamera(): Promise<CameraPick> {
-  const cams = await listVideoInputs();
-
-  // Heurísticas por label (Samsung/Pixel/otros)
-  const backish = cams.filter(d =>
-    /back|rear|environment/i.test(d.label) || /wide|0\.5|ultra/i.test(d.label)
+function looksBack(label: string) {
+  const s = label.toLowerCase();
+  return (
+    s.includes("back") ||
+    s.includes("rear") ||
+    s.includes("environment") ||
+    s.includes("trás") ||
+    s.includes("trasera")
   );
-
-  // 1) preferimos "environment" que NO diga ultra/wide/0.5/macro
-  const normal = backish.find(d => !/ultra|wide|0\.5|macro/i.test(d.label));
-  if (normal) return { deviceId: normal.deviceId, label: normal.label };
-
-  // 2) si no hay, tomamos la que diga back/rear/environment (aunque sea wide)
-  if (backish[0]) return { deviceId: backish[0].deviceId, label: backish[0].label };
-
-  // 3) fallback: cualquier cámara
-  if (cams[0]) return { deviceId: cams[0].deviceId, label: cams[0].label };
-
-  return {};
 }
 
-/** Aplica zoom 1× y enfoque continuo si el dispositivo lo permite */
-export async function applyTrackTuning(track: MediaStreamTrack) {
-  const caps: any = track.getCapabilities?.() || {};
-  const adv: any[] = [];
-  if (caps.zoom && typeof caps.zoom.min === 'number') {
-    // muchos Samsung exponen zoom lógico: 0.5 (ultra), 1, 2...
-    const oneX = Math.max(1, caps.zoom.min);
-    adv.push({ zoom: oneX });
-  }
-  if (caps.focusMode && caps.focusMode.includes('continuous')) {
-    adv.push({ focusMode: 'continuous' });
-  }
-  if (adv.length) {
-    try { await track.applyConstraints({ advanced: adv }); } catch {}
-  }
+function looksBad(label: string) {
+  const s = label.toLowerCase();
+  return BAD_KEYWORDS.some((k) => s.includes(k));
 }
 
-/** Inicia stream con varias estrategias para evitar gran angular */
-export async function startVideoStream(deviceId?: string): Promise<MediaStream> {
-  const base = {
-    audio: false,
-    video: {
-      width: { ideal: 1920 },
-      height: { ideal: 1080 },
-      frameRate: { ideal: 30, max: 60 }
-    } as MediaTrackConstraints
-  };
+/** Lista ordenada de cámaras de atrás, priorizando la "normal" sobre ultra‑wide/macro */
+export async function listBackCameras(): Promise<CameraChoice[]> {
+  const all = await navigator.mediaDevices.enumerateDevices();
+  const vids = all.filter((d) => d.kind === "videoinput") as MediaDeviceInfo[];
 
-  // 1) si tenemos deviceId, vamos directo
-  if (deviceId) {
-    try {
-      return await navigator.mediaDevices.getUserMedia({
-        ...base,
-        video: { ...base.video, deviceId: { exact: deviceId } }
-      });
-    } catch {}
-  }
+  // Si no hay labels (iOS/Android sin permiso), devolvemos tal cual.
+  // El permiso se consigue pidiendo getUserMedia antes.
+  const withLabels = vids.filter((v) => !!v.label);
 
-  // 2) “environment” exact
-  try {
-    return await navigator.mediaDevices.getUserMedia({
-      ...base,
-      video: { ...base.video, facingMode: { exact: 'environment' } }
-    });
-  } catch {}
-
-  // 3) “environment” preferido
-  return await navigator.mediaDevices.getUserMedia({
-    ...base,
-    video: { ...base.video, facingMode: 'environment' }
+  const scored = withLabels.map((v) => {
+    const label = v.label || "";
+    const back = looksBack(label) ? 2 : 0;
+    const normal = back && !looksBad(label) ? 2 : 0;
+    const penalty = looksBad(label) ? -2 : 0;
+    // Score mayor = mejor candidata
+    const score = back + normal + penalty;
+    return { deviceId: v.deviceId, label: label.trim(), score };
   });
+
+  // Si no hay labels, mejor devolver cualquier video input
+  if (scored.length === 0) {
+    return vids.map((v) => ({ deviceId: v.deviceId, label: v.label || "" }));
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map(({ deviceId, label }) => ({ deviceId, label }));
+}
+
+/** Elige la mejor cámara trasera "normal" */
+export async function pickBackCamera(): Promise<VideoPick> {
+  try {
+    // En algunos dispositivos, pedir permisos primero desbloquea los labels
+    try {
+      await navigator.mediaDevices.getUserMedia({ video: true });
+    } catch {}
+    const backs = await listBackCameras();
+    if (backs.length > 0) return { deviceId: backs[0].deviceId, label: backs[0].label };
+  } catch {}
+  // Fallback genérico (environment)
+  return { };
+}
+
+/** Abre el stream con constraints adecuados para escanear */
+export async function startVideoStream(
+  pick?: string
+): Promise<MediaStream> {
+  const constraints: MediaStreamConstraints = {
+    video: {
+      facingMode: { ideal: "environment" },
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+      // Evitar que el SO elija gran angular por "preferencia de FOV"
+      // (forzando sin exactitud: el track tuning corregirá después).
+      advanced: [{ zoom: 1 } as any],
+      deviceId: pick ? { exact: pick } : undefined,
+    }
+  };
+  return await navigator.mediaDevices.getUserMedia(constraints);
+}
+
+/** Aplica zoom 1× y enfocado continuo cuando está soportado */
+export async function applyTrackTuning(track: MediaStreamTrack) {
+  try {
+    const capabilities = (track.getCapabilities?.() || {}) as any;
+    const settings = (track.getSettings?.() || {}) as any;
+
+    const advanced: any[] = [];
+
+    if ("zoom" in capabilities) {
+      let z = 1;
+      const { min, max } = capabilities.zoom;
+      if (typeof min === "number" && typeof max === "number") {
+        // clamp to [min, max]
+        z = Math.min(max, Math.max(min, 1));
+      }
+      advanced.push({ zoom: z });
+    }
+
+    if (capabilities.focusMode && Array.isArray(capabilities.focusMode)) {
+      if (capabilities.focusMode.includes("continuous")) {
+        advanced.push({ focusMode: "continuous" });
+      } else if (capabilities.focusMode.includes("single-shot")) {
+        advanced.push({ focusMode: "single-shot" });
+      }
+    }
+
+    // Evitar balances raros
+    if (capabilities.whiteBalanceMode && Array.isArray(capabilities.whiteBalanceMode)) {
+      if (capabilities.whiteBalanceMode.includes("continuous")) {
+        advanced.push({ whiteBalanceMode: "continuous" });
+      }
+    }
+
+    if (advanced.length) {
+      await track.applyConstraints({ advanced });
+    }
+  } catch (e) {
+    // Silencioso: mejor no romper la UX si el dispositivo no soporta esto
+    console.debug("Track tuning skipped", e);
+  }
 }
