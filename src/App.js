@@ -110,8 +110,9 @@ function Ingreso({ categories, registerIngreso }) {
   const [deviceId, setDeviceId] = useState(localStorage.getItem(CAM_KEY) || "");
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
+  const [zoom, setZoom] = useState(1);
+  const [torch, setTorch] = useState(false);
   const streamRef = useRef(null);
-  const zxingLoopActive = useRef(false);
   const bdTimer = useRef(null);
 
   const [form, setForm] = useState({
@@ -119,7 +120,6 @@ function Ingreso({ categories, registerIngreso }) {
     serial: "", product: "", category: categories[0] || "", qty: 1, location: "", responsible: "", notes: ""
   });
 
-  // Hints: optimiza para códigos 1D como tus etiquetas (Code128/39/ITF/EAN/UPC)
   const makeReader = () => {
     const hints = new Map();
     hints.set(DecodeHintType.POSSIBLE_FORMATS, [
@@ -143,18 +143,63 @@ function Ingreso({ categories, registerIngreso }) {
       }
     } catch(e) { setScanError("Sin permiso de cámara. Activala en los permisos del navegador."); }
   };
-
   useEffect(() => { loadDevices(); return () => stopScan(); }, []);
   useEffect(() => { if (deviceId) localStorage.setItem(CAM_KEY, deviceId); }, [deviceId]);
 
   const openStream = async () => {
     const constraints = deviceId
-      ? { video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } } }
-      : { video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } } };
+      ? { video: { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } } }
+      : { video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } } };
     const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    const track = stream.getVideoTracks()[0];
+    try {
+      const caps = track.getCapabilities && track.getCapabilities();
+      if (caps && caps.focusMode && caps.focusMode.length) {
+        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+      }
+      if (caps && caps.zoom) {
+        setZoom(track.getSettings().zoom || caps.zoom.min || 1);
+      }
+    } catch {}
     videoRef.current.srcObject = stream;
     streamRef.current = stream;
     await videoRef.current.play();
+  };
+
+  const setZoomConstraint = async (value) => {
+    try {
+      const track = streamRef.current && streamRef.current.getVideoTracks()[0];
+      if (!track) return;
+      await track.applyConstraints({ advanced: [{ zoom: value }] });
+      setZoom(value);
+    } catch {}
+  };
+
+  const toggleTorch = async () => {
+    try {
+      const track = streamRef.current && streamRef.current.getVideoTracks()[0];
+      const caps = track && track.getCapabilities ? track.getCapabilities() : {};
+      if (!caps.torch) { alert("Tu cámara no expone linterna (torch)."); return; }
+      const current = track.getSettings && track.getSettings().torch;
+      await track.applyConstraints({ advanced: [{ torch: !current }] });
+      setTorch(!current);
+    } catch (e) { alert("No pude activar linterna: " + (e?.message || e)); }
+  };
+
+  // Offscreen canvas para ROI horizontal
+  const roiCanvas = document.createElement("canvas");
+  const ctx = roiCanvas.getContext("2d");
+
+  const captureROI = () => {
+    const video = videoRef.current;
+    if (!video || video.readyState < 2) return null;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return null;
+    const rx = Math.floor(vw * 0.1), rw = Math.floor(vw * 0.8);
+    const ry = Math.floor(vh * 0.4), rh = Math.floor(vh * 0.2);
+    roiCanvas.width = rw; roiCanvas.height = rh;
+    ctx.drawImage(video, rx, ry, rw, rh, 0, 0, rw, rh);
+    return roiCanvas;
   };
 
   const startScan = async () => {
@@ -163,39 +208,34 @@ function Ingreso({ categories, registerIngreso }) {
       setScanning(true);
       await openStream();
 
-      // 1) Intento con BarcodeDetector si soporta 1D
-      const supported = "BarcodeDetector" in window;
-      let bdFormats = [];
-      if (supported && window.BarcodeDetector.getSupportedFormats) {
-        try { bdFormats = await window.BarcodeDetector.getSupportedFormats(); } catch {}
-      }
-      const can1D = supported && bdFormats.some(f => ["code_128","code_39","itf","ean_13","ean_8","upc_a","codabar"].includes(f));
-
-      if (supported && can1D) {
+      if ("BarcodeDetector" in window) {
+        const supported = window.BarcodeDetector.getSupportedFormats ? await window.BarcodeDetector.getSupportedFormats() : [];
+        const can1D = supported.length ? supported.some(f => ["code_128","code_39","itf","ean_13","ean_8","upc_a"].includes(f)) : true;
         const detector = new window.BarcodeDetector({ formats: ["code_128","code_39","itf","ean_13","ean_8","upc_a"] });
+        let tries = 0;
         const loop = async () => {
           if (!scanning) return;
           try {
-            const codes = await detector.detect(videoRef.current);
-            if (codes && codes[0]) {
-              setForm(f => ({ ...f, serial: codes[0].rawValue }));
-              try { navigator.vibrate && navigator.vibrate(100); } catch {}
-              stopScan();
-              return;
+            const canvas = captureROI();
+            if (canvas) {
+              const codes = await detector.detect(canvas);
+              if (codes && codes[0]) {
+                setForm(f => ({ ...f, serial: codes[0].rawValue }));
+                try { navigator.vibrate && navigator.vibrate(100); } catch {}
+                stopScan(); return;
+              }
             }
           } catch {}
+          tries++;
           bdTimer.current = setTimeout(loop, 120);
+          if (tries === 30) { // ~3.5 s
+            runZXingCanvasLoop(); // cambio a ZXing si no hay lectura
+          }
         };
-        loop();
-
-        // Si a los 4 segundos no detecta, pasamos a ZXing continuo
-        setTimeout(() => {
-          if (scanning) { runZXingContinuous(); }
-        }, 4000);
-      } else {
-        // 2) Directo ZXing continuo
-        runZXingContinuous();
+        if (can1D) { loop(); return; }
       }
+
+      runZXingCanvasLoop();
     } catch (e) {
       setScanning(false);
       setScanError("No pude iniciar la cámara. Probá el modo Foto.");
@@ -203,30 +243,35 @@ function Ingreso({ categories, registerIngreso }) {
     }
   };
 
-  const runZXingContinuous = () => {
-    if (zxingLoopActive.current) return;
-    zxingLoopActive.current = true;
-    readerRef.current = makeReader();
-    readerRef.current.decodeFromVideoElementContinuously(videoRef.current, (result, err) => {
-      if (result) {
-        setForm(f => ({ ...f, serial: result.getText() }));
-        try { navigator.vibrate && navigator.vibrate(100); } catch {}
-        stopScan();
-      }
-      // err === NotFoundException mientras no encuentra; lo ignoramos
-    });
+  const runZXingCanvasLoop = () => {
+    const reader = makeReader();
+    const tick = async () => {
+      if (!scanning) return;
+      try {
+        const canvas = captureROI();
+        if (canvas) {
+          const result = await reader.decodeFromImage(canvas);
+          if (result) {
+            setForm(f => ({ ...f, serial: result.getText() }));
+            try { navigator.vibrate && navigator.vibrate(100); } catch {}
+            stopScan(); return;
+          }
+        }
+      } catch {}
+      setTimeout(tick, 120);
+    };
+    tick();
   };
 
   const stopScan = () => {
     if (bdTimer.current) { clearTimeout(bdTimer.current); bdTimer.current = null; }
-    try { readerRef.current?.reset(); } catch {}
+    try { readerRef.current?.reset?.(); } catch {}
     try {
       const stream = videoRef.current && videoRef.current.srcObject;
       if (stream) stream.getTracks().forEach(t => t.stop());
       if (videoRef.current) videoRef.current.srcObject = null;
     } catch {}
     streamRef.current = null;
-    zxingLoopActive.current = false;
     setScanning(false);
   };
 
@@ -277,13 +322,17 @@ function Ingreso({ categories, registerIngreso }) {
       {scanning && (
         <div className="scan-frame">
           <video ref={videoRef} autoPlay playsInline muted />
-          <div className="guide"></div>
+          <div className="belt"></div>
         </div>
       )}
       {!scanning && scanError && <div className="bad" style={{marginBottom:8}}>{scanError}</div>}
 
-      <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
+      <div className="controls">
         <button className="btn btn-primary" onClick={startScan} disabled={scanning}>Escanear (video)</button>
+        {scanning && <button className="btn btn-ghost" onClick={()=>setZoomConstraint(Math.max(1, zoom-0.2))}>- Zoom</button>}
+        {scanning && <input className="range" type="range" min="1" max="8" step="0.1" value={zoom} onChange={e=>setZoomConstraint(parseFloat(e.target.value))}/>}
+        {scanning && <button className="btn btn-ghost" onClick={()=>setZoomConstraint(zoom+0.2)}>+ Zoom</button>}
+        {scanning && <button className="btn btn-ghost" onClick={toggleTorch}>{torch?"Apagar linterna":"Linterna"}</button>}
         {scanning && <button className="btn btn-ghost" onClick={stopScan}>Detener</button>}
         <select className="input" value={deviceId} onChange={e=>setDeviceId(e.target.value)} style={{minWidth:220}}>
           <option value="">(Elegir cámara)</option>
@@ -309,7 +358,7 @@ function Ingreso({ categories, registerIngreso }) {
       </form>
 
       <p style={{fontSize:12,color:'#64748b',marginTop:10}}>
-        Optimizado para <b>Code128 / Code39 / ITF / EAN / UPC</b> (como los de tu foto). Si no detecta en video, usá la opción por foto mientras lo revisamos.
+        Alineá el código dentro de la <b>banda punteada</b> (horizontal). Ajustá <b>Zoom</b> y usá <b>Linterna</b> si hace falta.
       </p>
     </div>
   );
