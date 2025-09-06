@@ -1,0 +1,10 @@
+/* src/styles/scanner.css */
+/* Keep the overlay invisible until the <video> is playing to avoid grey screen + white line */
+#scanner-overlay.scanner-overlay-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+/* Optional: make overlay transition smoother */
+#scanner-overlay {
+  transition: opacity 120ms ease-out;
+}
