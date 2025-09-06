@@ -122,7 +122,7 @@ export default function App(){
   );
 }
 
-// -------- Ingreso con cámara: selector + forzar trasera + torch + recordar cámara ----------
+// -------- Ingreso con loop de BarcodeDetector + ZXing fallback ----------
 function Ingreso({ categories, registerIngreso }) {
   const videoRef = useRef(null);
   const readerRef = useRef(null);
@@ -132,6 +132,7 @@ function Ingreso({ categories, registerIngreso }) {
   const [scanError, setScanError] = useState("");
   const [torch, setTorch] = useState(false);
   const streamRef = useRef(null);
+  const bdLoopRef = useRef(null);
 
   const [form, setForm] = useState({
     date: toDateInputValue(new Date()),
@@ -157,39 +158,67 @@ function Ingreso({ categories, registerIngreso }) {
   useEffect(() => { loadDevices(); return () => stopScan(); }, []);
   useEffect(() => { if (deviceId) localStorage.setItem(CAM_KEY, deviceId); }, [deviceId]);
 
+  const openStream = async () => {
+    // Preferir trasera y buena resolución
+    const constraints = deviceId
+      ? { video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } } }
+      : { video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } } };
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    const track = stream.getVideoTracks()[0];
+    // intentar foco continuo si existe
+    try {
+      const caps = track.getCapabilities && track.getCapabilities();
+      if (caps && caps.focusMode && caps.focusMode.length) {
+        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+      }
+    } catch {}
+    videoRef.current.srcObject = stream;
+    streamRef.current = stream;
+    await videoRef.current.play();
+  };
+
   const startScan = async () => {
     setScanError("");
     try {
-      if (!readerRef.current) readerRef.current = new BrowserMultiFormatReader();
       setScanning(true);
-      if (deviceId) {
-        await readerRef.current.decodeFromVideoDevice(deviceId, videoRef.current, onResult);
-      } else {
-        await readerRef.current.decodeFromConstraints({ video: { facingMode: { ideal: "environment" } } }, videoRef.current, onResult);
-      }
-      // guardar stream para torch
-      streamRef.current = videoRef.current.srcObject;
-    } catch (e) {
-      setScanning(false);
-      setScanError("No pude iniciar la cámara. Probá el botón Forzar trasera o el modo Foto.");
-      alert("DEBUG ▶ " + (e?.name || "") + ": " + (e?.message || e));
-    }
-  };
+      await openStream();
 
-  const forceBack = async () => {
-    setScanError("");
-    try {
+      // 1) Si existe BarcodeDetector, usamos loop sobre el video (suele ser más fiable en Android)
+      if ("BarcodeDetector" in window) {
+        const formats = ["code_128","code_39","qr_code","ean_13","ean_8","upc_a","itf"];
+        const detector = new window.BarcodeDetector({ formats });
+        const loop = async () => {
+          if (!scanning || !videoRef.current) return;
+          try {
+            const codes = await detector.detect(videoRef.current);
+            if (codes && codes[0]) {
+              const val = codes[0].rawValue;
+              setForm(f => ({ ...f, serial: val }));
+              try { navigator.vibrate && navigator.vibrate(100); } catch {}
+              stopScan();
+              return;
+            }
+          } catch {}
+          bdLoopRef.current = setTimeout(loop, 160); // ~6 fps
+        };
+        loop();
+        return;
+      }
+
+      // 2) Fallback ZXing en video
       if (!readerRef.current) readerRef.current = new BrowserMultiFormatReader();
-      setScanning(true);
-      await readerRef.current.decodeFromConstraints(
-        { video: { facingMode: { exact: "environment" } } },
-        videoRef.current,
-        onResult
-      );
-      streamRef.current = videoRef.current.srcObject;
+      await readerRef.current.decodeFromVideoDevice(deviceId || undefined, videoRef.current, (result, err, controls) => {
+        if (result) {
+          const text = result.getText();
+          setForm(f => ({ ...f, serial: text }));
+          try { navigator.vibrate && navigator.vibrate(100); } catch {}
+          controls.stop();
+          stopScan();
+        }
+      });
     } catch (e) {
       setScanning(false);
-      setScanError("No pude forzar la trasera. Elegí otra en el selector o usá el modo Foto.");
+      setScanError("No pude iniciar la cámara. Probá el modo Foto.");
       alert("DEBUG ▶ " + (e?.name || "") + ": " + (e?.message || e));
     }
   };
@@ -201,24 +230,16 @@ function Ingreso({ categories, registerIngreso }) {
       const track = stream.getVideoTracks()[0];
       const caps = track.getCapabilities ? track.getCapabilities() : {};
       if (!caps.torch) { alert("Tu cámara no expone linterna (torch)."); return; }
-      await track.applyConstraints({ advanced: [{ torch: !torch }] });
-      setTorch(!torch);
+      const current = track.getSettings && track.getSettings().torch;
+      await track.applyConstraints({ advanced: [{ torch: !current }] });
+      setTorch(!current);
     } catch (e) {
       alert("No pude activar linterna: " + (e?.message || e));
     }
   };
 
-  const onResult = (result, err, controls) => {
-    if (result) {
-      const text = result.getText();
-      setForm(f => ({ ...f, serial: text }));
-      try { navigator.vibrate && navigator.vibrate(100); } catch {}
-      controls.stop();
-      stopScan();
-    }
-  };
-
   const stopScan = () => {
+    if (bdLoopRef.current) { clearTimeout(bdLoopRef.current); bdLoopRef.current = null; }
     try { readerRef.current?.reset(); } catch {}
     try {
       const stream = videoRef.current && videoRef.current.srcObject;
@@ -283,7 +304,6 @@ function Ingreso({ categories, registerIngreso }) {
 
       <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
         <button className="btn btn-primary" onClick={startScan} disabled={scanning}>Escanear (video)</button>
-        <button className="btn btn-ghost" onClick={forceBack} disabled={scanning}>Forzar trasera</button>
         {scanning && <button className="btn btn-ghost" onClick={toggleTorch}>{torch?"Apagar linterna":"Linterna"}</button>}
         {scanning && <button className="btn btn-ghost" onClick={stopScan}>Detener</button>}
         <select className="input" value={deviceId} onChange={e=>setDeviceId(e.target.value)} style={{minWidth:220}}>
@@ -310,7 +330,7 @@ function Ingreso({ categories, registerIngreso }) {
       </form>
 
       <p style={{fontSize:12,color:'#64748b',marginTop:10}}>
-        Si no te ofrece “trasera” en el selector, usá <b>Forzar trasera</b>. Si aún así falla, <b>Escanear con foto</b> abre la cámara nativa y decodifica la imagen.
+        Este modo usa <b>BarcodeDetector</b> (si está disponible) sobre el video y cae a ZXing si no. Si no lee, usá la linterna, acercá el código o probá la opción por foto.
       </p>
     </div>
   );
