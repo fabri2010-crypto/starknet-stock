@@ -95,7 +95,7 @@ export default function App(){
           </div>
           <div style={{display:'flex',alignItems:'center',gap:8}}>
             <span style={{fontSize:13,color:'#475569'}}>Usuario</span>
-            <select className="input" value={currentUser} onChange={e=>handleUserChange(e.target.value)}>
+            <select className="input" value={currentUser} onChange={(e)=>handleUserChange(e.target.value)}>
               {data.settings.users.map(u => <option key={u.name} value={u.name}>{u.name}</option>)}
             </select>
           </div>
@@ -121,7 +121,7 @@ export default function App(){
   );
 }
 
-// -------- Ingreso con cámara: selección + fallback ----------
+// -------- Ingreso con cámara: selección + fallback + debug ----------
 function Ingreso({ categories, registerIngreso }) {
   const videoRef = useRef(null);
   const readerRef = useRef(null);
@@ -169,16 +169,8 @@ function Ingreso({ categories, registerIngreso }) {
         onResult
       );
     } catch (e) {
-      // 3) Último fallback: abrir stream manual para que el usuario vea el error de permisos
       setScanning(false);
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-        if (videoRef.current) videoRef.current.srcObject = stream;
-        setScanError("No pude iniciar el lector, pero la cámara está abierta. Si no ves imagen, son permisos.");
-      } catch (err) {
-        setScanError("No pude abrir la cámara. Revisá permisos/otra app usando la cámara.");
-        alert("No pude abrir la cámara: " + (err?.message || err));
-      }
+      setScanError("No pude iniciar el lector. Probá el botón 'Probar cámara (debug)'. Detalle: " + (e?.message || e));
     }
   };
 
@@ -202,6 +194,20 @@ function Ingreso({ categories, registerIngreso }) {
     setScanning(false);
   };
 
+  // --- Botón de diagnóstico: abre la cámara sin ZXing y muestra el error exacto ---
+  const debugOpen = async () => {
+    setScanError("");
+    try {
+      const constraints = deviceId ? { video: { deviceId: { exact: deviceId } } } : { video: { facingMode: "environment" } };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      if (videoRef.current) videoRef.current.srcObject = stream;
+      setScanning(true);
+    } catch (err) {
+      setScanError(`DEBUG ▶ ${err.name}: ${err.message}`);
+      alert(`DEBUG ▶ ${err.name}: ${err.message}`);
+    }
+  };
+
   const onSubmit = (e) => {
     e.preventDefault();
     if(!form.serial) return alert("Escaneá o escribí el Nº de serie");
@@ -223,10 +229,11 @@ function Ingreso({ categories, registerIngreso }) {
       <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
         <button className="btn btn-primary" onClick={startScan} disabled={scanning}>Escanear código</button>
         {scanning && <button className="btn btn-ghost" onClick={stopScan}>Detener cámara</button>}
-        <select className="input" value={deviceId} onChange={e=>setDeviceId(e.target.value)} style={{minWidth:200}}>
+        <select className="input" value={deviceId} onChange={e=>setDeviceId(e.target.value)} style={{minWidth:220}}>
           <option value="">(Elegir cámara)</option>
           {devices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}
         </select>
+        <button className="btn btn-ghost" onClick={debugOpen}>Probar cámara (debug)</button>
       </div>
 
       <form className="grid grid-3" onSubmit={onSubmit}>
@@ -245,8 +252,8 @@ function Ingreso({ categories, registerIngreso }) {
       </form>
 
       <p style={{fontSize:12,color:'#64748b',marginTop:10}}>
-        Si ves pantalla negra o este sitio no tiene permiso de cámara: Chrome → icono del candado → Permisos → Cámara: <b>Permitir</b>.
-        Si aparece “otra app está usando la cámara”, cerrá WhatsApp, Instagram o el scanner del sistema.
+        Si ves pantalla negra o “Could not start video source”: revisá permisos del sitio y cerrá apps que usen la cámara.
+        Con el botón <b>Probar cámara (debug)</b> vas a ver el error exacto si algo bloquea el acceso.
       </p>
     </div>
   );
