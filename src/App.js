@@ -35,7 +35,7 @@ function toDateInputValue(date) {
 
 export default function App(){
   const [data,setData] = useLocalStorage(STORAGE_KEY, seed);
-  const [tab,setTab] = useState("inventario");
+  const [tab,setTab] = useState("ingreso");
   const [currentUser, setCurrentUser] = useState("Fabricio");
 
   const handleUserChange = (next) => {
@@ -56,25 +56,13 @@ export default function App(){
       if (exists) {
         inventory = d.inventory.map((i) =>
           i.serial.trim() === (serial||"").trim()
-            ? {
-                ...i,
-                product: i.product || product,
-                category: i.category || category,
-                location: location || i.location,
-                stock: (Number(i.stock || 0) + Number(qty || 0)),
-              }
+            ? { ...i, product: i.product || product, category: i.category || category, location: location || i.location, stock: (Number(i.stock || 0) + Number(qty || 0)) }
             : i
         );
       } else {
-        inventory = [
-          ...d.inventory,
-          { serial, product, category, stock: Number(qty || 0), location, notes: notes || "" },
-        ];
+        inventory = [ ...d.inventory, { serial, product, category, stock: Number(qty || 0), location, notes: notes || "" } ];
       }
-      const movements = [
-        ...d.movements,
-        { date, serial, product, person:"INGRESO MATERIAL", qty:Number(qty||0), responsible:responsible||"", notes:notes||"", type:"Ingreso", user: currentUser }
-      ];
+      const movements = [ ...d.movements, { date, serial, product, person:"INGRESO MATERIAL", qty:Number(qty||0), responsible:responsible||"", notes:notes||"", type:"Ingreso", user: currentUser } ];
       return { ...d, inventory, movements };
     });
   };
@@ -86,14 +74,10 @@ export default function App(){
       const movements = [...d.movements, newMov];
       let inv = d.inventory;
       if (newMov.type === "Entrega") {
-        inv = d.inventory.map((it) =>
-          it.serial === mov.serial ? { ...it, stock: Math.max(0, (+it.stock||0) - (+mov.qty||0)) } : it
-        );
+        inv = d.inventory.map((it) => it.serial === mov.serial ? { ...it, stock: Math.max(0, (+it.stock||0) - (+mov.qty||0)) } : it );
       }
       if (newMov.type === "Devolución") {
-        inv = d.inventory.map((it) =>
-          it.serial === mov.serial ? { ...it, stock: (+it.stock||0) + (+mov.qty||0) } : it
-        );
+        inv = d.inventory.map((it) => it.serial === mov.serial ? { ...it, stock: (+it.stock||0) + (+mov.qty||0) } : it );
       }
       return { ...d, movements, inventory: inv };
     });
@@ -141,31 +125,59 @@ function Ingreso({ categories, registerIngreso }) {
   const videoRef = useRef(null);
   const readerRef = useRef(null);
   const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState("");
   const [form, setForm] = useState({
     date: toDateInputValue(new Date()),
     serial: "", product: "", category: categories[0] || "", qty: 1, location: "", responsible: "", notes: ""
   });
 
-  const startScan = async () => {
+  const getBackCameraId = async () => {
     try {
+      const devices = await BrowserMultiFormatReader.listVideoInputDevices();
+      if (!devices || !devices.length) return undefined;
+      const back = devices.find(d => /back|rear|environment|trás|atrás/i.test(d.label || ""));
+      return (back || devices[0]).deviceId;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const startScan = async () => {
+    setScanError("");
+    try {
+      // Pre-solicitar permiso
+      await navigator.mediaDevices.getUserMedia({ video: true });
+      // Elegir cámara trasera si hay
+      const deviceId = await getBackCameraId();
       if (!readerRef.current) readerRef.current = new BrowserMultiFormatReader();
       setScanning(true);
-      await readerRef.current.decodeFromVideoDevice(undefined, videoRef.current, (result, err, controls) => {
+      await readerRef.current.decodeFromVideoDevice(deviceId, videoRef.current, (result, err, controls) => {
         if (result) {
           const text = result.getText();
-          setForm(f=>({ ...f, serial: text }));
+          setForm(f => ({ ...f, serial: text }));
           try { navigator.vibrate && navigator.vibrate(100); } catch {}
-          controls.stop(); setScanning(false);
+          controls.stop();
+          stopScan();
         }
       });
     } catch (e) {
       setScanning(false);
-      alert("No pude abrir la cámara: " + (e?.message || e));
+      setScanError("No pude abrir la cámara. Revisá permisos del navegador.");
+      alert("No pude abrir la cámara: " + (e && e.message ? e.message : e));
     }
   };
 
-  const stopScan = () => { try{ readerRef.current?.reset(); }catch{} setScanning(false); };
-  useEffect(()=>()=>{ try{ readerRef.current?.reset(); }catch{} },[]);
+  const stopScan = () => {
+    try { readerRef.current?.reset(); } catch {}
+    try {
+      const stream = videoRef.current && videoRef.current.srcObject;
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      if (videoRef.current) videoRef.current.srcObject = null;
+    } catch {}
+    setScanning(false);
+  };
+
+  useEffect(() => () => { stopScan(); }, []);
 
   const onSubmit = (e) => {
     e.preventDefault();
@@ -183,6 +195,7 @@ function Ingreso({ categories, registerIngreso }) {
       <h2 style={{marginBottom:8}}>Ingreso de material</h2>
 
       {scanning && <video ref={videoRef} autoPlay playsInline muted style={{width:"100%",borderRadius:12,marginBottom:10,background:"#000"}} />}
+      {!scanning && scanError && <div style={{color:"#b91c1c",marginBottom:8}}>{scanError}</div>}
 
       <div style={{display:'flex',gap:8,marginBottom:12}}>
         {!scanning
@@ -204,7 +217,9 @@ function Ingreso({ categories, registerIngreso }) {
           <button className="btn btn-orange" type="submit">Guardar ingreso</button>
         </div>
       </form>
-      <p style={{fontSize:12,color:'#64748b',marginTop:10}}>Tip: si no se abre la cámara, asegurate de dar permiso al navegador. En iPhone usá Safari; en Android, Chrome.</p>
+      <p style={{fontSize:12,color:'#64748b',marginTop:10}}>
+        Tip: si no se abre la cámara, revisá en el navegador Permisos → Cámara → Permitir para este sitio.
+      </p>
     </div>
   );
 }
