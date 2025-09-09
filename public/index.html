@@ -3,10 +3,26 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>STARKNET Stock</title>
-    <link rel="icon" type="image/png" href="/favicon.png">
+    <title>starknet-stock (scanner fix)</title>
+    <style>
+      html,body,#root{height:100%;margin:0;padding:0;background:#0b0d12;color:#e8e8e8;font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial}
+      .app{display:flex;flex-direction:column;gap:16px;align-items:center;justify-content:flex-start;padding:16px}
+      .card{width:100%;max-width:640px;background:#131722;border:1px solid #1f2430;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.35)}
+      .card h2{margin:0;padding:16px 16px 0}
+      .card .content{padding:16px}
+      .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+      video{width:100%;border-radius:12px}
+      .btn{padding:10px 14px;border-radius:10px;border:1px solid #2a3140;background:#1a2030;color:#e8e8e8;cursor:pointer}
+      .btn:disabled{opacity:.5;cursor:not-allowed}
+      select{padding:8px;border-radius:10px;border:1px solid #2a3140;background:#0f1320;color:#e8e8e8}
+      .badge{display:inline-block;padding:4px 8px;border-radius:999px;border:1px solid #2a3140;background:#0f1320;color:#9ecbff;font-size:12px}
+      .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace}
+      .success{color:#7fda89}
+      .warn{color:#ffcc66}
+    </style>
   </head>
   <body>
+    <noscript>Necesitás habilitar JavaScript.</noscript>
     <div id="root"></div>
   </body>
 </html>
